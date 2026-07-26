@@ -1,0 +1,61 @@
+name: Publish terminal MCP candidate image
+
+on:
+  push:
+    branches:
+      - build/terminal-tool-result-image
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: publish-terminal-mcp-candidate
+  cancel-in-progress: false
+
+env:
+  SOURCE_REVISION: 560bed385f06cde1bddc54f6246ef8e80a99aa0c
+  IMAGE_NAME: ghcr.io/brianmills2718/hermes-agent
+
+jobs:
+  publish-amd64:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Check out the reviewed source revision
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ env.SOURCE_REVISION }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@4907a6ddec9925e35a0a9e82d7399ccc52663121 # v4.1.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and publish the reviewed candidate
+        id: build
+        uses: docker/build-push-action@bcafcacb16a39f128d818304e6c9c0c18556b85f # v7.1.0
+        with:
+          context: .
+          file: Dockerfile
+          platforms: linux/amd64
+          push: true
+          tags: ${{ env.IMAGE_NAME }}:terminal-mcp-560bed38
+          labels: |
+            org.opencontainers.image.revision=${{ env.SOURCE_REVISION }}
+            org.opencontainers.image.source=https://github.com/BrianMills2718/hermes-agent
+          build-args: |
+            HERMES_GIT_SHA=${{ env.SOURCE_REVISION }}
+          cache-from: type=gha,scope=terminal-mcp-amd64
+          cache-to: type=gha,mode=max,scope=terminal-mcp-amd64
+
+      - name: Record immutable digest
+        run: |
+          printf 'image=%s\n' "${IMAGE_NAME}"
+          printf 'source_revision=%s\n' "${SOURCE_REVISION}"
+          printf 'digest=%s\n' "${{ steps.build.outputs.digest }}"
