@@ -153,7 +153,11 @@ const autolinkUrl = (raw: string) =>
 const defaultLinkLabel = (url: string) =>
   url.startsWith('mailto:') ? url.replace(/^mailto:/, '') : /^https?:\/\//i.test(url) ? urlSlugTitleLabel(url) : url
 
-const pickFallbackLabel = (label: string | undefined, target: string): string | undefined => {
+// An authored label is only authored if it says something the URL doesn't.
+// `[https://example.com](https://example.com)` and `<https://example.com>`
+// both arrive here with the target as their "label" — those are bare links
+// wearing markdown syntax, so they still want a fetched title.
+const pickAuthoredLabel = (label: string | undefined, target: string): string | undefined => {
   const trimmed = label?.trim()
 
   if (!trimmed) {
@@ -164,14 +168,18 @@ const pickFallbackLabel = (label: string | undefined, target: string): string | 
 }
 
 interface ResolvedLinkProps {
-  fallbackLabel?: string
+  authoredLabel?: string
   t: Theme
   url: string
 }
 
-function ResolvedLink({ fallbackLabel, t, url }: ResolvedLinkProps) {
-  const fetched = useLinkTitle(url)
-  const display = fetched || fallbackLabel || defaultLinkLabel(url)
+// Title resolution is a fallback for links that have no text of their own,
+// not an override. When the author wrote `[Read the RFC](url)`, that text is
+// the intent — fetching the page title and replacing it throws away better
+// wording than we can derive, and mangles deliberate labels like `#71706`.
+function ResolvedLink({ authoredLabel, t, url }: ResolvedLinkProps) {
+  const fetched = useLinkTitle(authoredLabel ? null : url)
+  const display = authoredLabel || fetched || defaultLinkLabel(url)
 
   return (
     <Link url={url}>
@@ -185,7 +193,7 @@ function ResolvedLink({ fallbackLabel, t, url }: ResolvedLinkProps) {
 const renderResolvedLink = (k: number, t: Theme, rawUrl: string, label?: string) => {
   const target = normalizeExternalUrl(rawUrl)
 
-  return <ResolvedLink fallbackLabel={pickFallbackLabel(label, target)} key={k} t={t} url={target} />
+  return <ResolvedLink authoredLabel={pickAuthoredLabel(label, target)} key={k} t={t} url={target} />
 }
 
 export const stripInlineMarkup = (v: string) =>
