@@ -14,7 +14,7 @@ concurrency:
   cancel-in-progress: false
 
 env:
-  SOURCE_REVISION: 9921f374ca23bf92036dcf2a234eaaa00f62ebfc
+  SOURCE_REVISION: 262c8e087cb4c8f36d818d1d1a14181a8e3dc7c7
   IMAGE_NAME: ghcr.io/brianmills2718/hermes-agent
 
 jobs:
@@ -45,7 +45,7 @@ jobs:
           file: Dockerfile
           platforms: linux/amd64
           push: true
-          tags: ${{ env.IMAGE_NAME }}:terminal-mcp-9921f37
+          tags: ${{ env.IMAGE_NAME }}:terminal-mcp-sqlite-safe-262c8e0
           labels: |
             org.opencontainers.image.revision=${{ env.SOURCE_REVISION }}
             org.opencontainers.image.source=https://github.com/BrianMills2718/hermes-agent
