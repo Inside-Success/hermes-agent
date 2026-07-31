@@ -31,6 +31,33 @@ RUN apt-get -o Acquire::Retries=3 update && \
     ca-certificates curl iputils-ping python3 python-is-python3 ripgrep ffmpeg gcc g++ make cmake python3-dev python3-venv libffi-dev libolm-dev procps git openssh-client docker-cli xz-utils && \
     rm -rf /var/lib/apt/lists/*
 
+# Debian 13.4 links Python to SQLite 3.46.1. That release contains SQLite's
+# WAL-reset corruption bug, which is unsafe for Hermes' multi-process profile
+# state databases (dashboard, gateway, and direct TUI turns can all open the
+# same state.db). Build the first upstream fixed release and verify that the
+# exact Python interpreter used by the container resolves it before installing
+# Hermes. Keep the source checksum pinned just like the other downloaded build
+# inputs in this image.
+ARG SQLITE_AUTOCONF_VERSION=3510300
+ARG SQLITE_AUTOCONF_SHA256=81f5be397049b0cae1b167f2225af7646fc0f82e4a9b3c48c9ea3a533e21d77a
+RUN set -eu; \
+    archive="sqlite-autoconf-${SQLITE_AUTOCONF_VERSION}.tar.gz"; \
+    url="https://www.sqlite.org/2026/${archive}"; \
+    curl -fsSL --retry 3 -o "/tmp/${archive}" "${url}"; \
+    printf '%s  %s\n' "${SQLITE_AUTOCONF_SHA256}" "/tmp/${archive}" \
+        | sha256sum -c -; \
+    mkdir -p /tmp/sqlite-src; \
+    tar -xzf "/tmp/${archive}" -C /tmp/sqlite-src --strip-components=1; \
+    cd /tmp/sqlite-src; \
+    ./configure --prefix=/usr/local --disable-static --fts5; \
+    make -j"$(nproc)"; \
+    make install; \
+    ldconfig; \
+    python3 -c \
+        'import sqlite3; assert sqlite3.sqlite_version_info >= (3, 51, 3), sqlite3.sqlite_version'; \
+    cd /; \
+    rm -rf /tmp/sqlite-src "/tmp/${archive}"
+
 # ---------- s6-overlay install ----------
 # s6-overlay provides supervision for the main hermes process, the dashboard,
 # and per-profile gateways. /init becomes PID 1 below — see ENTRYPOINT.
