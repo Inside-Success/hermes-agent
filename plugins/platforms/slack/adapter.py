@@ -118,6 +118,24 @@ _SLACK_SPECIAL_MENTION_RE = re.compile(
 # in this chart?" posted as a reply under an image).
 _THREAD_ROOT_IMAGE_MAX = 4
 
+# Cold-start thread hydration is prepended to a single model turn. Slack's
+# message-count limit is not a content budget: link unfurls and long bot posts
+# can make a 30-message thread exceed 100k characters. Preserve the thread
+# parent and the newest prior messages, but bound both individual messages and
+# the complete injected block. The agent can retrieve older source evidence
+# through its normal tools when the explicit omission marker is present.
+_THREAD_CONTEXT_MAX_CHARS = 24_000
+_THREAD_CONTEXT_MESSAGE_MAX_CHARS = 6_000
+_THREAD_CONTEXT_TRUNCATION_MARKER = " … [message truncated]"
+
+
+def _truncate_thread_context_part(text: str) -> str:
+    """Bound one rendered Slack context line without silently dropping it."""
+    if len(text) <= _THREAD_CONTEXT_MESSAGE_MAX_CHARS:
+        return text
+    keep = _THREAD_CONTEXT_MESSAGE_MAX_CHARS - len(_THREAD_CONTEXT_TRUNCATION_MARKER)
+    return text[:keep].rstrip() + _THREAD_CONTEXT_TRUNCATION_MARKER
+
 
 def _slack_file_marker(file_obj: Dict[str, Any]) -> str:
     """Render a compact text marker for a Slack file attachment.
@@ -7135,7 +7153,12 @@ class SlackAdapter(BasePlatformAdapter):
         extras: list[str] = []
         if blocks:
             rich_text = _extract_text_from_slack_blocks(blocks).strip()
-            if rich_text and rich_text not in msg_text:
+            if (
+                rich_text
+                and rich_text not in msg_text
+                and _normalize_slack_text_for_dedupe(rich_text)
+                != _normalize_slack_text_for_dedupe(msg_text)
+            ):
                 extras.append(rich_text)
             for block in blocks:
                 block_type = (block or {}).get("type", "")
@@ -7151,8 +7174,16 @@ class SlackAdapter(BasePlatformAdapter):
         attachments_text = _extract_text_from_slack_attachments(
             msg.get("attachments") or []
         ).strip()
-        if attachments_text and attachments_text not in msg_text and all(
-            attachments_text not in e for e in extras
+        normalized_attachment = _normalize_slack_text_for_dedupe(attachments_text)
+        if (
+            attachments_text
+            and attachments_text not in msg_text
+            and normalized_attachment != _normalize_slack_text_for_dedupe(msg_text)
+            and all(
+                attachments_text not in e
+                and normalized_attachment != _normalize_slack_text_for_dedupe(e)
+                for e in extras
+            )
         ):
             extras.append(attachments_text)
         if blocks:
@@ -7347,7 +7378,7 @@ class SlackAdapter(BasePlatformAdapter):
         from gateway.session import neutralize_untrusted_inline_text
 
         bot_uid = self._team_bot_user_ids.get(team_id, self._bot_user_id)
-        context_parts = []
+        context_parts: list[tuple[bool, str]] = []
         parent_text = ""
         for msg in messages:
             msg_ts = msg.get("ts", "")
@@ -7399,7 +7430,7 @@ class SlackAdapter(BasePlatformAdapter):
                 msg_text = msg_text.replace(f"<@{bot_uid}>", "").strip()
 
             if is_parent:
-                parent_text = msg_text
+                parent_text = _truncate_thread_context_part(msg_text)
                 if skip_for_delta:
                     continue
 
@@ -7430,7 +7461,9 @@ class SlackAdapter(BasePlatformAdapter):
                 # Skip user-name resolution for self-bot replies — the
                 # ``[assistant]`` prefix already communicates authorship,
                 # and the resolved name would just be our own bot handle.
-                context_parts.append(f"{prefix}{msg_text}")
+                context_parts.append(
+                    (is_parent, _truncate_thread_context_part(f"{prefix}{msg_text}"))
+                )
             else:
                 name = await self._resolve_user_name(
                     display_user, chat_id=channel_id, team_id=team_id
@@ -7445,17 +7478,51 @@ class SlackAdapter(BasePlatformAdapter):
                 # fake "## SYSTEM" / "## Override" heading) — the same indirect-
                 # prompt-injection vector the sender-name prefix, reply quote,
                 # and relay channel-context already neutralize. Collapse each to
-                # a single inert line; ``max_chars=0`` keeps the body untruncated
-                # (thread context caps the message *count*, not per-message
-                # length). The trusted ``prefix``/``trust_tag`` we add ourselves
-                # stay outside the neutralized fields.
+                # a single inert line. The complete rendered line is bounded
+                # below; a message-count cap alone does not constrain Slack
+                # unfurls or long bot posts. The trusted ``prefix``/``trust_tag``
+                # we add ourselves stay outside the neutralized fields.
                 safe_name = neutralize_untrusted_inline_text(name)
                 safe_text = neutralize_untrusted_inline_text(msg_text, max_chars=0)
-                context_parts.append(f"{prefix}{trust_tag}{safe_name}: {safe_text}")
+                context_parts.append(
+                    (
+                        is_parent,
+                        _truncate_thread_context_part(
+                            f"{prefix}{trust_tag}{safe_name}: {safe_text}"
+                        ),
+                    )
+                )
 
         content = ""
         if context_parts:
-            has_unverified = any("[unverified] " in part for part in context_parts)
+            # Keep the parent plus as many newest replies as fit. This mirrors
+            # conversational relevance while making omission observable.
+            parent_parts = [part for is_parent, part in context_parts if is_parent]
+            reply_parts = [part for is_parent, part in context_parts if not is_parent]
+            selected_parent = parent_parts[:1]
+            max_header_chars = 500
+            end_marker = "\n[End of thread context]\n\n"
+            omission_reserve = 100
+            body_budget = max(
+                0,
+                _THREAD_CONTEXT_MAX_CHARS
+                - max_header_chars
+                - len(end_marker)
+                - omission_reserve,
+            )
+            used = sum(len(part) + 1 for part in selected_parent)
+            selected_replies_reversed: list[str] = []
+            for part in reversed(reply_parts):
+                projected = used + len(part) + 1
+                if projected > body_budget:
+                    continue
+                selected_replies_reversed.append(part)
+                used = projected
+            selected_replies = list(reversed(selected_replies_reversed))
+            omitted_count = len(context_parts) - len(selected_parent) - len(selected_replies)
+            selected_parts = selected_parent + selected_replies
+
+            has_unverified = any("[unverified] " in part for part in selected_parts)
             if has_unverified:
                 header = (
                     "[Thread context — prior messages in this thread "
@@ -7471,11 +7538,21 @@ class SlackAdapter(BasePlatformAdapter):
                     "[Thread context — prior messages in this thread "
                     "(not yet in conversation history):]"
                 )
-            content = (
-                header + "\n"
-                + "\n".join(context_parts)
-                + "\n[End of thread context]\n\n"
-            )
+            body_parts = list(selected_parent)
+            if omitted_count:
+                body_parts.append(
+                    f"[Earlier thread context omitted: {omitted_count} messages "
+                    "exceeded the context budget.]"
+                )
+            body_parts.extend(selected_replies)
+            content = header + "\n" + "\n".join(body_parts) + end_marker
+            # The selection reserves the longest header and omission marker;
+            # retain a final invariant guard so future wording cannot silently
+            # violate the model-input boundary.
+            if len(content) > _THREAD_CONTEXT_MAX_CHARS:
+                raise RuntimeError(
+                    "Slack thread context exceeded its configured character budget"
+                )
         return content, parent_text
 
     async def _fetch_thread_parent_text(
