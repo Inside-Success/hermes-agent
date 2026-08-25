@@ -3553,10 +3553,14 @@ def _connect_cooldown_active(server_name: str) -> bool:
     deadline = _server_connect_retry_after.get(server_name)
     return deadline is not None and time.monotonic() < deadline
 
-# Circuit breaker: consecutive error counts per server.  After
+# Circuit breaker: consecutive TRANSPORT failure counts per server.  After
 # _CIRCUIT_BREAKER_THRESHOLD consecutive failures, the handler returns
 # a "server unreachable" message that tells the model to stop retrying,
 # preventing the 90-iteration burn loop described in #10447.
+#
+# "Failure" here means the server did not answer. A tool that answers with a
+# refusal or a provider error is a working server, and must not count: the
+# breaker's message asserts the server is unreachable, which would be false.
 #
 # State machine:
 #   closed    — error count below threshold; all calls go through.
@@ -4715,15 +4719,24 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
 
         try:
             result = _call_once()
-            # Check if the MCP tool itself returned an error
-            try:
-                parsed = json.loads(result)
-                if "error" in parsed:
-                    _bump_server_error(server_name)
-                else:
-                    _reset_server_error(server_name)  # success — reset
-            except (json.JSONDecodeError, TypeError):
-                _reset_server_error(server_name)  # non-JSON = success
+            # A returned result means the RPC round-trip completed: the server
+            # answered, so the breaker closes — including when the tool itself
+            # reported a failure. This is the same fact `_mark_session_proven`
+            # records inside `_call` above.
+            #
+            # This block used to parse the result and bump the breaker on any
+            # top-level "error" key, which counted ordinary tool REFUSALS as
+            # server failures. Three of "you have not connected Google", "the
+            # brain is not in that channel", or "not authorized to read this
+            # meeting" in a row opened the breaker, and the model then told the
+            # user its MCP server was "unreachable after 3 consecutive
+            # failures". It was reachable — it had just answered three times.
+            #
+            # Nothing stops being counted: every genuine transport failure
+            # bumps at its own site (breaker-open short-circuit, no connected
+            # server, and the generic exception path below), and none of those
+            # reach this line.
+            _reset_server_error(server_name)
             return result
         except InterruptedError:
             return _interrupted_call_result()
