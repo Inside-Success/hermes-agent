@@ -536,3 +536,144 @@ class TestRegression_ToolsetScoping:
         # core tools are never deferrable
         assert "terminal" not in names
 
+
+
+class TestAlwaysVisiblePin:
+    """`mcp_servers.<server>.tools.always_visible` keeps chosen MCP tools loaded.
+
+    Core Hermes tools are never deferred, but before this it was all of an MCP
+    server's tools or none. A server with ~90 tools usually has a handful that
+    answer most turns; deferring those buys nothing and costs a `tool_search`
+    round trip on nearly every request.
+    """
+
+    def test_pinned_mcp_tools_stay_in_the_visible_array(self, monkeypatch):
+        from tools import tool_search as ts
+
+        monkeypatch.setattr(
+            ts, "always_visible_names", lambda: frozenset({"slack_catch_up"})
+        )
+        monkeypatch.setattr(
+            ts, "is_deferrable_tool_name", lambda n: n.startswith("mcp__")
+        )
+        defs = [
+            _td("mcp__knowledge__slack_catch_up"),
+            _td("mcp__knowledge__gmail_thread"),
+            _td("terminal"),
+        ]
+        visible, deferrable = ts.classify_tools(defs)
+        assert sorted(d["function"]["name"] for d in visible) == [
+            "mcp__knowledge__slack_catch_up",
+            "terminal",
+        ]
+        assert [d["function"]["name"] for d in deferrable] == [
+            "mcp__knowledge__gmail_thread"
+        ]
+
+    def test_no_pins_restores_the_previous_behaviour(self, monkeypatch):
+        from tools import tool_search as ts
+
+        monkeypatch.setattr(ts, "always_visible_names", lambda: frozenset())
+        monkeypatch.setattr(
+            ts, "is_deferrable_tool_name", lambda n: n.startswith("mcp__")
+        )
+        defs = [_td("mcp__knowledge__slack_catch_up"), _td("terminal")]
+        visible, deferrable = ts.classify_tools(defs)
+        assert [d["function"]["name"] for d in visible] == ["terminal"]
+        assert [d["function"]["name"] for d in deferrable] == [
+            "mcp__knowledge__slack_catch_up"
+        ]
+
+    def test_config_is_read_per_server_and_tolerates_junk(self, monkeypatch):
+        from tools import tool_search as ts
+
+        monkeypatch.setattr(
+            ts, "load_config_readonly", lambda: None, raising=False
+        )
+        cfg = {
+            "mcp_servers": {
+                "knowledge": {"tools": {"always_visible": ["a", " b ", "", 7]}},
+                "other": {"tools": {"always_visible": "c"}},
+                "broken": {"tools": "not-a-dict"},
+                "nothing": {},
+            }
+        }
+        import hermes_cli.config as hc
+
+        monkeypatch.setattr(hc, "load_config_readonly", lambda: cfg)
+        assert ts.always_visible_names() == frozenset({"a", "b", "c"})
+
+    def test_an_unreadable_config_defers_everything_rather_than_erroring(
+        self, monkeypatch
+    ):
+        import hermes_cli.config as hc
+
+        from tools import tool_search as ts
+
+        def _boom():
+            raise RuntimeError("no config")
+
+        monkeypatch.setattr(hc, "load_config_readonly", _boom)
+        assert ts.always_visible_names() == frozenset()
+
+    def test_bare_name_strips_only_the_mcp_prefix(self):
+        from tools import tool_search as ts
+
+        assert ts._bare_mcp_tool_name("mcp__knowledge__send_email") == "send_email"
+        assert ts._bare_mcp_tool_name("terminal") == "terminal"
+        assert ts._bare_mcp_tool_name("") == ""
+
+
+class TestInlineSearchHitParameters:
+    """A small tool's argument names ride along with the hit, skipping a hop."""
+
+    def test_small_tools_carry_their_parameters(self):
+        from tools import tool_search as ts
+
+        entry = ts.CatalogEntry(
+            name="x",
+            description="d",
+            source="mcp",
+            source_name="mcp-k",
+            schema={
+                "type": "function",
+                "function": {
+                    "name": "x",
+                    "description": "d",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "a": {"type": "string"},
+                            "b": {"type": "integer"},
+                        },
+                        "required": ["a"],
+                    },
+                },
+            },
+        )
+        hit = ts._format_search_hit(entry)
+        assert hit["parameters"] == {
+            "a": {"type": "string", "required": True},
+            "b": {"type": "integer", "required": False},
+        }
+
+    def test_wide_tools_still_need_tool_describe(self):
+        from tools import tool_search as ts
+
+        entry = ts.CatalogEntry(
+            name="y",
+            description="d",
+            source="mcp",
+            source_name="mcp-k",
+            schema=_td("y", properties={f"p{i}": {"type": "string"} for i in range(6)}),
+        )
+        assert "parameters" not in ts._format_search_hit(entry)
+
+    def test_no_argument_tools_add_nothing(self):
+        from tools import tool_search as ts
+
+        entry = ts.CatalogEntry(
+            name="z", description="d", source="mcp", source_name="mcp-k",
+            schema=_td("z", properties={}),
+        )
+        assert "parameters" not in ts._format_search_hit(entry)
