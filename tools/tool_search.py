@@ -160,6 +160,55 @@ def _core_tool_names() -> frozenset[str]:
         return frozenset()
 
 
+def always_visible_names() -> frozenset[str]:
+    """Bare MCP tool names pinned visible by config.
+
+    Read from ``mcp_servers.<server>.tools.always_visible``. Core Hermes tools
+    are never deferred, but before this there was no way to say the same about a
+    handful of MCP tools — it was all of a server's tools or none. A server with
+    ~90 tools usually has a few that answer most turns; deferring those buys
+    nothing and costs a `tool_search` round trip on almost every request.
+
+    Names are matched WITHOUT the ``mcp__<server>__`` prefix, so config can name
+    the tool the way the server does. Any failure yields an empty set, which
+    simply restores the previous behaviour of deferring everything.
+    """
+    try:
+        from hermes_cli.config import load_config_readonly
+        cfg = load_config_readonly() or {}
+    except Exception as e:
+        logger.debug("Failed to load config for always_visible: %s", e)
+        return frozenset()
+
+    servers = cfg.get("mcp_servers")
+    if not isinstance(servers, dict):
+        return frozenset()
+
+    pinned: set[str] = set()
+    for server_cfg in servers.values():
+        if not isinstance(server_cfg, dict):
+            continue
+        tools_cfg = server_cfg.get("tools")
+        if not isinstance(tools_cfg, dict):
+            continue
+        raw = tools_cfg.get("always_visible")
+        if isinstance(raw, str):
+            raw = [raw]
+        if not isinstance(raw, (list, tuple)):
+            continue
+        for name in raw:
+            if isinstance(name, str) and name.strip():
+                pinned.add(name.strip())
+    return frozenset(pinned)
+
+
+def _bare_mcp_tool_name(name: str) -> str:
+    """``mcp__server__tool`` -> ``tool``; anything else unchanged."""
+    if name.startswith("mcp__") and "__" in name[5:]:
+        return name.rsplit("__", 1)[-1]
+    return name
+
+
 def is_deferrable_tool_name(name: str) -> bool:
     """Return True if a tool with this name is *eligible* for deferral.
 
@@ -190,9 +239,10 @@ def classify_tools(tool_defs: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]
     """Split a tool-defs list into (visible, deferrable).
 
     ``visible`` retains every tool that must stay in the model-facing array:
-    every core tool, plus any tool we can't classify. ``deferrable`` is the
-    candidate set for catalog entry.
+    every core tool, every MCP tool pinned by ``tools.always_visible``, plus any
+    tool we can't classify. ``deferrable`` is the candidate set for catalog entry.
     """
+    pinned = always_visible_names()
     visible: List[Dict[str, Any]] = []
     deferrable: List[Dict[str, Any]] = []
     for td in tool_defs:
@@ -202,7 +252,9 @@ def classify_tools(tool_defs: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]
             # Should never happen — bridge tools are added after classification —
             # but be defensive.
             continue
-        if is_deferrable_tool_name(name):
+        if pinned and _bare_mcp_tool_name(name) in pinned:
+            visible.append(td)
+        elif is_deferrable_tool_name(name):
             deferrable.append(td)
         else:
             visible.append(td)
@@ -592,14 +644,33 @@ def is_bridge_tool(name: str) -> bool:
     return name in BRIDGE_TOOL_NAMES
 
 
+# A hit carrying this many parameters or fewer also carries their names, so the
+# model can call the tool straight away instead of spending a `tool_describe`
+# round trip. Small on purpose: the point is to skip a hop for simple tools, not
+# to re-inline the schemas that deferral just removed.
+_INLINE_PARAMS_MAX = 3
+
+
 def _format_search_hit(entry: CatalogEntry) -> Dict[str, Any]:
-    return {
+    hit: Dict[str, Any] = {
         "name": entry.name,
         "source": entry.source,
         "source_name": entry.source_name,
         # Cap description so a chatty MCP server doesn't blow up the result.
         "description": (entry.description or "")[:400],
     }
+    fn = (entry.schema or {}).get("function") or {}
+    params = (fn.get("parameters") or {}).get("properties") or {}
+    if 0 < len(params) <= _INLINE_PARAMS_MAX:
+        required = (fn.get("parameters") or {}).get("required") or []
+        hit["parameters"] = {
+            key: {
+                "type": (spec or {}).get("type", "string"),
+                "required": key in required,
+            }
+            for key, spec in params.items()
+        }
+    return hit
 
 
 def dispatch_tool_search(args: Dict[str, Any],
