@@ -1,5 +1,6 @@
 """Tests for the dashboard-managed file browser API."""
 
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -109,6 +110,34 @@ def test_forced_root_file_upload_list_read_delete_roundtrip(forced_files_client)
     )
     assert deleted.status_code == 200
     assert not file_path.exists()
+
+
+def test_listing_skips_file_that_disappears_before_stat(forced_files_client, monkeypatch):
+    client, root = forced_files_client
+    root.mkdir(parents=True, exist_ok=True)
+    regular = root / "regular.txt"
+    regular.write_text("stable")
+    transient = root / "kanban.db-shm"
+    transient.write_text("sqlite sidecar")
+
+    original_stat = Path.stat
+    transient_failed = False
+
+    def stat_with_transient_race(path, *args, **kwargs):
+        nonlocal transient_failed
+        if path == transient and not transient_failed:
+            transient_failed = True
+            transient.unlink()
+            raise FileNotFoundError(path)
+        return original_stat(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "stat", stat_with_transient_race)
+
+    listing = client.get("/api/files", params={"path": str(root)})
+
+    assert transient_failed
+    assert listing.status_code == 200
+    assert [entry["name"] for entry in listing.json()["entries"]] == ["regular.txt"]
 
 
 def test_directory_management_requires_recursive_delete_for_nonempty_dirs(forced_files_client):
