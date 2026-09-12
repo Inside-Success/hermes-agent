@@ -2225,9 +2225,18 @@ def _managed_response_meta(policy: ManagedFilesPolicy) -> Dict[str, Any]:
     }
 
 
-def _managed_file_entry(policy: ManagedFilesPolicy, target: Path) -> Dict[str, Any]:
+def _managed_file_entry(
+    policy: ManagedFilesPolicy,
+    target: Path,
+    *,
+    missing_ok: bool = False,
+) -> Optional[Dict[str, Any]]:
     try:
         resolved = target.resolve()
+    except FileNotFoundError:
+        if missing_ok:
+            return None
+        raise HTTPException(status_code=400, detail="Invalid path")
     except (OSError, RuntimeError):
         raise HTTPException(status_code=400, detail="Invalid path")
     if policy.locked_root is not None and not _path_is_under(policy.locked_root, resolved):
@@ -2235,6 +2244,10 @@ def _managed_file_entry(policy: ManagedFilesPolicy, target: Path) -> Dict[str, A
 
     try:
         st = resolved.stat()
+    except FileNotFoundError as exc:
+        if missing_ok:
+            return None
+        raise HTTPException(status_code=500, detail=f"Could not stat path: {exc}")
     except OSError as exc:
         raise HTTPException(status_code=500, detail=f"Could not stat path: {exc}")
 
@@ -2361,11 +2374,13 @@ async def list_managed_files(request: Request, path: Optional[str] = None):
         raise HTTPException(status_code=400, detail="Path is not a directory")
 
     try:
-        entries = [
-            _managed_file_entry(policy, child)
-            for child in target.iterdir()
-            if not _is_sensitive_path(child)
-        ]
+        entries = []
+        for child in target.iterdir():
+            if _is_sensitive_path(child):
+                continue
+            entry = _managed_file_entry(policy, child, missing_ok=True)
+            if entry is not None:
+                entries.append(entry)
     except PermissionError:
         raise HTTPException(status_code=403, detail="Directory is not readable")
     except OSError as exc:
