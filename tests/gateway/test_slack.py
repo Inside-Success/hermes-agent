@@ -295,6 +295,17 @@ class TestBotEventDiagnostics:
         # allow_bots policy helper.
         assert a._slack_allow_bots() == "all"
 
+    def test_allowed_automations_yaml_bridge(self, monkeypatch):
+        from plugins.platforms.slack.adapter import _apply_yaml_config
+
+        # Seed through monkeypatch so teardown restores the environment even
+        # though the YAML bridge itself writes os.environ directly.
+        monkeypatch.setenv("SLACK_ALLOWED_AUTOMATIONS", "")
+        _apply_yaml_config(
+            {}, {"allowed_automations": ["A_TRUSTED", "B_TRUSTED"]}
+        )
+        assert os.environ["SLACK_ALLOWED_AUTOMATIONS"] == "A_TRUSTED,B_TRUSTED"
+
 
 # ---------------------------------------------------------------------------
 # TestSlashCommandSessionIsolation
@@ -3436,6 +3447,98 @@ class TestMessageRouting:
         }
         await adapter._handle_slack_message(event)
         adapter.handle_message.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_allowed_automations_rejects_unknown_app_even_when_all_enabled(
+        self, adapter
+    ):
+        """Wake policy and sender trust are independent controls."""
+        adapter.config.extra.update(
+            {"allow_bots": "all", "allowed_automations": ["A_TRUSTED"]}
+        )
+        event = {
+            "text": "run this",
+            "app_id": "A_UNKNOWN",
+            "bot_id": "B_UNKNOWN",
+            "user": "U_OWNER",
+            "channel": "D123",
+            "channel_type": "im",
+            "ts": "1234567890.000020",
+        }
+
+        await adapter._handle_slack_message(event)
+
+        adapter.handle_message.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_allowed_app_routes_with_explicit_automation_provenance(
+        self, adapter
+    ):
+        """An allowlisted app can wake Hermes without masquerading as human."""
+        adapter.config.extra.update(
+            {"allow_bots": "all", "allowed_automations": ["A_TRUSTED"]}
+        )
+        event = {
+            "text": "prepare a summary",
+            "app_id": "A_TRUSTED",
+            "bot_id": "B_TRUSTED",
+            "user": "U_OWNER",
+            "channel": "D123",
+            "channel_type": "im",
+            "ts": "1234567890.000021",
+        }
+
+        await adapter._handle_slack_message(event)
+
+        adapter.handle_message.assert_called_once()
+        message = adapter.handle_message.call_args.args[0]
+        assert message.source.is_bot is True
+        assert message.metadata["sender_kind"] == "automation"
+        assert message.metadata["slack_automation_ids"] == [
+            "A_TRUSTED",
+            "B_TRUSTED",
+        ]
+
+    @pytest.mark.asyncio
+    async def test_human_user_id_cannot_allow_every_app_acting_as_that_user(
+        self, adapter
+    ):
+        adapter.config.extra.update(
+            {"allow_bots": "all", "allowed_automations": ["U_OWNER"]}
+        )
+        event = {
+            "text": "run this",
+            "app_id": "A_UNKNOWN",
+            "user": "U_OWNER",
+            "channel": "D123",
+            "channel_type": "im",
+            "ts": "1234567890.000023",
+        }
+
+        await adapter._handle_slack_message(event)
+
+        adapter.handle_message.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_allowed_automations_does_not_restrict_human_messages(self, adapter):
+        adapter.config.extra.update(
+            {"allow_bots": "mentions", "allowed_automations": ["A_TRUSTED"]}
+        )
+        event = {
+            "text": "hello",
+            "client_msg_id": "human-client-id",
+            "user": "U_HUMAN",
+            "channel": "D123",
+            "channel_type": "im",
+            "ts": "1234567890.000022",
+        }
+
+        await adapter._handle_slack_message(event)
+
+        message = adapter.handle_message.call_args.args[0]
+        assert message.source.is_bot is False
+        assert message.metadata["sender_kind"] == "human"
+        assert message.metadata["slack_automation_ids"] == []
 
     @pytest.mark.asyncio
     async def test_known_bot_users_ignored_even_without_bot_markers(self, adapter):

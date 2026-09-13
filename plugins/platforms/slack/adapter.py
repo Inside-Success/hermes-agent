@@ -3103,6 +3103,44 @@ class SlackAdapter(BasePlatformAdapter):
             return "none"
         return value
 
+    def _slack_allowed_automations(self) -> frozenset[str]:
+        """Return Slack app, bot, or bot-user IDs trusted to reach ingress.
+
+        ``allow_bots`` decides *when* automation may wake Hermes.  This
+        optional allowlist independently decides *which* automation identities
+        may do so.  Keeping the controls separate avoids treating an @mention
+        as authentication while preserving the historical unrestricted
+        ``allow_bots`` behavior when no allowlist is configured.
+        """
+        raw = self.config.extra.get("allowed_automations")
+        if raw is None:
+            raw = os.getenv("SLACK_ALLOWED_AUTOMATIONS", "")
+        if isinstance(raw, (list, tuple, set, frozenset)):
+            values = raw
+        else:
+            values = str(raw or "").replace(",", " ").split()
+        return frozenset(str(value).strip() for value in values if str(value).strip())
+
+    @staticmethod
+    def _automation_sender_ids(event: dict, sender_is_bot: bool) -> frozenset[str]:
+        """Return every stable Slack identity asserted for an automation."""
+        if not sender_is_bot:
+            return frozenset()
+        application_ids = frozenset(
+            str(event.get(key) or "").strip()
+            for key in ("app_id", "bot_id")
+            if str(event.get(key) or "").strip()
+        )
+        # Prefer application identities whenever Slack supplies them.  A user
+        # token can make an app-authored event carry the installing human's
+        # ``user`` ID; accepting that ID would accidentally trust every app
+        # acting on behalf of the same person.  The user ID is a fallback only
+        # for bot-user events that Slack delivers without app/bot markers.
+        if application_ids:
+            return application_ids
+        user_id = str(event.get("user") or "").strip()
+        return frozenset({user_id}) if user_id else frozenset()
+
     def _event_declares_bot_sender(self, event: dict) -> bool:
         """Return True when the Slack event itself identifies a bot sender."""
         if event.get("bot_id") or event.get("bot_profile"):
@@ -5324,6 +5362,14 @@ class SlackAdapter(BasePlatformAdapter):
             allow_bots = self._slack_allow_bots()
             if allow_bots == "none":
                 return
+            allowed_automations = self._slack_allowed_automations()
+            sender_ids = self._automation_sender_ids(event, sender_is_bot)
+            if allowed_automations and not sender_ids.intersection(allowed_automations):
+                logger.debug(
+                    "[Slack] Dropping automation message: sender identities are not "
+                    "in allowed_automations"
+                )
+                return
             elif allow_bots == "mentions":
                 # Include Block-Kit-only mentions, not just the flat text (#52387)
                 text_check = _slack_mention_detection_text(event)
@@ -5623,13 +5669,7 @@ class SlackAdapter(BasePlatformAdapter):
         # this bot — thread history, reply parents, and active sessions do not
         # count as a bot-to-bot summons.
         if user_id and user_id != bot_uid:
-            sender_is_bot_user = self._event_declares_bot_sender(event)
-            if not sender_is_bot_user:
-                sender_is_bot_user = await self._resolve_user_is_bot(
-                    user_id,
-                    chat_id=channel_id,
-                    team_id=team_id,
-                )
+            sender_is_bot_user = sender_is_bot
             if sender_is_bot_user:
                 allow_bots = self._slack_allow_bots()
                 if allow_bots == "none":
@@ -6210,7 +6250,10 @@ class SlackAdapter(BasePlatformAdapter):
             # subtype=bot_message with user=None; flag them so the
             # gateway SLACK_ALLOW_BOTS bypass can authorize them
             # (they carry no user_id to match against the allowlist).
-            is_bot=bool(event.get("bot_id")) or event.get("subtype") == "bot_message",
+            # Preserve the already-resolved provenance.  ``app_id``-only and
+            # users.info-resolved bot events are automation too; downstream
+            # authorization must not mistake them for human Slack turns.
+            is_bot=sender_is_bot,
         )
 
         # Per-channel ephemeral prompt
@@ -6292,6 +6335,10 @@ class SlackAdapter(BasePlatformAdapter):
                 "slack_team_id": team_id,
                 "slack_channel_id": channel_id,
                 "slack_thread_ts": thread_ts,
+                "sender_kind": "automation" if sender_is_bot else "human",
+                "slack_automation_ids": sorted(
+                    self._automation_sender_ids(event, sender_is_bot)
+                ),
             },
         )
 
@@ -8988,6 +9035,11 @@ def _apply_yaml_config(yaml_cfg: dict, slack_cfg: dict) -> dict | None:
         ).lower()
     if "allow_bots" in slack_cfg and not os.getenv("SLACK_ALLOW_BOTS"):
         os.environ["SLACK_ALLOW_BOTS"] = str(slack_cfg["allow_bots"]).lower()
+    allowed_automations = slack_cfg.get("allowed_automations")
+    if allowed_automations is not None and not os.getenv("SLACK_ALLOWED_AUTOMATIONS"):
+        if isinstance(allowed_automations, (list, tuple, set)):
+            allowed_automations = ",".join(str(v) for v in allowed_automations)
+        os.environ["SLACK_ALLOWED_AUTOMATIONS"] = str(allowed_automations)
     frc = slack_cfg.get("free_response_channels")
     if frc is not None and not os.getenv("SLACK_FREE_RESPONSE_CHANNELS"):
         if isinstance(frc, list):
@@ -9058,7 +9110,8 @@ def register(ctx) -> None:
         setup_fn=interactive_setup,
         # YAML→env config bridge — owns the translation of config.yaml slack:
         # keys (require_mention, strict_mention, ignore_other_user_mentions,
-        # thread_require_mention, allow_bots, free_response_channels,
+        # thread_require_mention, allow_bots, allowed_automations,
+        # free_response_channels,
         # reactions, disable_dms, allowed_channels, ignored_channels) into
         # SLACK_* env vars that
         # the adapter reads via os.getenv(). Replaces the

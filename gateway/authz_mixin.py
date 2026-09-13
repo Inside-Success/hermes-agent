@@ -445,7 +445,8 @@ class GatewayAuthorizationMixin:
             except Exception:
                 pass
 
-        # Bots admitted by {PLATFORM}_ALLOW_BOTS bypass the human allowlist (#4466).
+        # Bots admitted by {PLATFORM}_ALLOW_BOTS bypass the human allowlist only
+        # when the platform supplied no user identity (#4466).
         # Checked before the no-user-id guard below: some platforms deliver
         # bot/automation traffic with no user_id at all -- e.g. Slack Workflow
         # Builder posts arrive as subtype=bot_message with user=None -- so
@@ -457,7 +458,7 @@ class GatewayAuthorizationMixin:
             Platform.TELEGRAM: "TELEGRAM_ALLOW_BOTS",
             Platform.SLACK: "SLACK_ALLOW_BOTS",
         }
-        if getattr(source, "is_bot", False):
+        if getattr(source, "is_bot", False) and not user_id:
             allow_bots_var = platform_allow_bots_map.get(source.platform)
             if allow_bots_var and os.getenv(allow_bots_var, "none").lower().strip() in {"mentions", "all"}:
                 return True

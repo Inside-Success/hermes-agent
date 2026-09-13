@@ -62,6 +62,17 @@ def _make_slack_human_source(user_id="U_human"):
     )
 
 
+def _make_slack_bot_user_source(user_id="U_bot"):
+    return SessionSource(
+        platform=Platform.SLACK,
+        chat_id="C0123",
+        chat_type="group",
+        user_id=user_id,
+        user_name="Automation",
+        is_bot=True,
+    )
+
+
 def test_slack_bot_authorized_when_allow_bots_all(monkeypatch):
     runner = _make_bare_runner()
     monkeypatch.setenv("SLACK_ALLOW_BOTS", "all")
@@ -90,3 +101,16 @@ def test_slack_human_unaffected_by_bot_bypass(monkeypatch):
     runner = _make_bare_runner()
     monkeypatch.setenv("SLACK_ALLOW_ALL_USERS", "true")
     assert runner._is_user_authorized(_make_slack_human_source()) is True
+
+
+def test_slack_bot_with_user_id_does_not_bypass_human_allowlist(monkeypatch):
+    runner = _make_bare_runner()
+    monkeypatch.setenv("SLACK_ALLOW_BOTS", "all")
+    assert runner._is_user_authorized(_make_slack_bot_user_source()) is False
+
+
+def test_slack_bot_with_user_id_can_pass_explicit_user_allowlist(monkeypatch):
+    runner = _make_bare_runner()
+    monkeypatch.setenv("SLACK_ALLOW_BOTS", "all")
+    monkeypatch.setenv("SLACK_ALLOWED_USERS", "U_bot")
+    assert runner._is_user_authorized(_make_slack_bot_user_source()) is True

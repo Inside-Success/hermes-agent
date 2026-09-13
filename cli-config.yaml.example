@@ -969,6 +969,15 @@ platform_toolsets:
 #         priority_mode: prepend
 #         priority:
 #           - my_plugin_command
+#   slack:
+#     extra:
+#       # Automation is denied by default. "mentions" permits only messages
+#       # that freshly @mention this bot; "all" permits passive automation too.
+#       allow_bots: none              # none | mentions | all
+#       # Optional second gate: only these Slack app IDs (A...), bot IDs (B...),
+#       # or marker-less bot-user IDs (U...) may enter. Prefer A/B IDs: an app
+#       # using a user token can carry the human's U... ID without being human.
+#       allowed_automations: []
 #   webhook:
 #     extra:
 #       # Route scripts default to a 30 second timeout. Scripts must live under
