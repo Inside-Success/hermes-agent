@@ -1,0 +1,65 @@
+{
+  "active_slice": {
+    "description": "Separate Slack automation ingress from human authorization with explicit app identity and safe defaults.",
+    "next_action": null,
+    "requires_external_action": false,
+    "requires_spend": false,
+    "slice_id": "HERMES-SLACK-TRUST-01",
+    "status": "accepted",
+    "target_revision": "8e8c4bf444432c98dff65aabfc77b43b988034cf"
+  },
+  "authority": {
+    "external_action_authorized": false,
+    "human_decision": null,
+    "human_decision_required": false,
+    "implementation_authorized": true,
+    "spend_cap_usd": 0,
+    "spend_used_usd": 0
+  },
+  "circuit_breakers": {
+    "context_integrity_valid": true,
+    "max_same_boundary_failures": 3,
+    "runtime_integrity_valid": true
+  },
+  "completion": {
+    "evidence_revision": "8e8c4bf444432c98dff65aabfc77b43b988034cf",
+    "receipt_ref": "hermes-agent@8e8c4bf444432c98dff65aabfc77b43b988034cf:pytest-439-passed;ruff-passed",
+    "remaining_ready_work": 0,
+    "requested": true,
+    "verifier_outcome": "pass"
+  },
+  "cursor_id": "slack-ingress-trust-policy-20260912",
+  "cursor_revision": 2,
+  "failure_state": {
+    "boundary": null,
+    "last_failure_ref": null,
+    "same_boundary_failures": 0
+  },
+  "goal_ref": "user-approved:slack-ingress-trust-policy-20260912",
+  "lifecycle_state": "complete",
+  "observations": [
+    {
+      "boundary": "slack-ingress-filter",
+      "evidence_ref": "plugins/platforms/slack/adapter.py:3095,5301;gateway/authz_mixin.py:451",
+      "kind": "authentic_result",
+      "observation_id": "current-binary-policy",
+      "outcome": "fail"
+    },
+    {
+      "boundary": "slack-ingress-and-authorization",
+      "evidence_ref": "hermes-agent@8e8c4bf444432c98dff65aabfc77b43b988034cf:pytest-439-passed;ruff-passed",
+      "kind": "authentic_result",
+      "observation_id": "provenance-policy-tests",
+      "outcome": "pass"
+    }
+  ],
+  "plan_revision": "hermes-agent@bd6818c59be6faa78b03e7cf0c815cfa41ad18a7",
+  "ready_alternatives": [],
+  "record_type": "plan_execution_cursor",
+  "schema_version": "1.0",
+  "target": {
+    "branch": "feat/slack-ingress-trust-policy-20260912",
+    "repository": "Inside-Success/hermes-agent",
+    "worktree": "/home/brian/code/hermes-agent/worktrees/feat/slack-ingress-trust-policy-20260912"
+  }
+}

@@ -165,7 +165,7 @@ class SessionSource:
     chat_topic: Optional[str] = None  # Channel topic/description (Discord, Slack)
     user_id_alt: Optional[str] = None  # Platform-specific stable alt ID (Signal UUID, Feishu union_id)
     chat_id_alt: Optional[str] = None  # Signal group internal ID
-    is_bot: bool = False  # True when the message author is a bot/webhook (Discord)
+    is_bot: bool = False  # True when the platform resolved a bot/app/webhook author
     # Platform-neutral SCOPE discriminator (Discord guild / Slack workspace /
     # Matrix server). Drives server/workspace isolation + the relay δ/ε/ζ gate.
     # Wire migration (D-Q2.5): `scope_id` is the canonical name; `guild_id` is a
