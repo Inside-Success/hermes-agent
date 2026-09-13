@@ -1,0 +1,58 @@
+{
+  "active_slice": {
+    "description": "Separate Slack automation ingress from human authorization with explicit app identity and safe defaults.",
+    "next_action": "Add typed Slack automation provenance, sender allowlists, and authorization-preserving tests.",
+    "requires_external_action": false,
+    "requires_spend": false,
+    "slice_id": "HERMES-SLACK-TRUST-01",
+    "status": "executing",
+    "target_revision": "bd6818c59be6faa78b03e7cf0c815cfa41ad18a7"
+  },
+  "authority": {
+    "external_action_authorized": false,
+    "human_decision": null,
+    "human_decision_required": false,
+    "implementation_authorized": true,
+    "spend_cap_usd": 0,
+    "spend_used_usd": 0
+  },
+  "circuit_breakers": {
+    "context_integrity_valid": true,
+    "max_same_boundary_failures": 3,
+    "runtime_integrity_valid": true
+  },
+  "completion": {
+    "evidence_revision": null,
+    "receipt_ref": null,
+    "remaining_ready_work": 1,
+    "requested": false,
+    "verifier_outcome": null
+  },
+  "cursor_id": "slack-ingress-trust-policy-20260912",
+  "cursor_revision": 1,
+  "failure_state": {
+    "boundary": null,
+    "last_failure_ref": null,
+    "same_boundary_failures": 0
+  },
+  "goal_ref": "user-approved:slack-ingress-trust-policy-20260912",
+  "lifecycle_state": "active",
+  "observations": [
+    {
+      "boundary": "slack-ingress-filter",
+      "evidence_ref": "plugins/platforms/slack/adapter.py:3095,5301;gateway/authz_mixin.py:451",
+      "kind": "authentic_result",
+      "observation_id": "current-binary-policy",
+      "outcome": "fail"
+    }
+  ],
+  "plan_revision": "hermes-agent@bd6818c59be6faa78b03e7cf0c815cfa41ad18a7",
+  "ready_alternatives": [],
+  "record_type": "plan_execution_cursor",
+  "schema_version": "1.0",
+  "target": {
+    "branch": "feat/slack-ingress-trust-policy-20260912",
+    "repository": "Inside-Success/hermes-agent",
+    "worktree": "/home/brian/code/hermes-agent/worktrees/feat/slack-ingress-trust-policy-20260912"
+  }
+}
