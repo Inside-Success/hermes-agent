@@ -1,0 +1,65 @@
+{
+  "active_slice": {
+    "description": "Port the previously proven WAL-safe SQLite Docker build onto the merged provenance-aware Slack runtime revision.",
+    "next_action": null,
+    "requires_external_action": true,
+    "requires_spend": false,
+    "slice_id": "wal-safe-org-runtime",
+    "status": "accepted",
+    "target_revision": "5f922b0c5d1131e4c5a3b6c3b3d779c27a30f439"
+  },
+  "authority": {
+    "external_action_authorized": true,
+    "human_decision": null,
+    "human_decision_required": false,
+    "implementation_authorized": true,
+    "spend_cap_usd": 0,
+    "spend_used_usd": 0
+  },
+  "circuit_breakers": {
+    "context_integrity_valid": true,
+    "max_same_boundary_failures": 3,
+    "runtime_integrity_valid": true
+  },
+  "completion": {
+    "evidence_revision": "5f922b0c5d1131e4c5a3b6c3b3d779c27a30f439",
+    "receipt_ref": "ghcr.io/inside-success/hermes-agent@sha256:2cf9165b34989dc9d64ec690a4170d409f06082cb4757342cc85e8d4cb31a479;sqlite=3.51.3",
+    "remaining_ready_work": 0,
+    "requested": true,
+    "verifier_outcome": "pass"
+  },
+  "cursor_id": "hermes-wal-safe-org-runtime-20260913",
+  "cursor_revision": 2,
+  "failure_state": {
+    "boundary": null,
+    "last_failure_ref": null,
+    "same_boundary_failures": 0
+  },
+  "goal_ref": "user-approved:second-brain-slack-deployment-20260913",
+  "lifecycle_state": "complete",
+  "observations": [
+    {
+      "boundary": "production-image-preflight",
+      "evidence_ref": "new organization image sha256:6e2762e7c397fe0569bd4e91fba4dc806c4b1500a9a24918b53c2dd3e5e17ab6 reports SQLite 3.46.1; prior focused fix 262c8e087 builds and asserts 3.51.3",
+      "kind": "verification_failure",
+      "observation_id": "org-image-wal-runtime-blocker",
+      "outcome": "fail"
+    },
+    {
+      "boundary": "production-image-preflight",
+      "evidence_ref": "ghcr.io/inside-success/hermes-agent@sha256:2cf9165b34989dc9d64ec690a4170d409f06082cb4757342cc85e8d4cb31a479 reports SQLite 3.51.3",
+      "kind": "authentic_result",
+      "observation_id": "org-image-wal-runtime-pass",
+      "outcome": "pass"
+    }
+  ],
+  "plan_revision": "conversation:2026-09-13-approved-slack-deployment@1",
+  "ready_alternatives": [],
+  "record_type": "plan_execution_cursor",
+  "schema_version": "1.0",
+  "target": {
+    "branch": "fix/wal-safe-sqlite-org-runtime-20260913",
+    "repository": "Inside-Success/hermes-agent",
+    "worktree": "/home/brian/code/hermes-agent/worktrees/fix/wal-safe-sqlite-org-runtime-20260913"
+  }
+}
