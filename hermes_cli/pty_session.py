@@ -190,6 +190,20 @@ class PtySessionRegistry:
         self._sessions.pop(oldest.key, None)
         asyncio.create_task(oldest.close())
 
+    async def close(self, key: str) -> bool:
+        """Close one keep-alive session by its registry key; False if none.
+
+        A controller that drove a turn to completion knows the turn is over and
+        has no use for the child afterwards. Without this, that child idles until
+        the TTL reaper — and the hosted TUI deliberately refuses /quit, /exit and
+        Ctrl-C/Ctrl-D, so nothing typed into the PTY can end it.
+        """
+        session = self._sessions.pop(key, None)
+        if session is None:
+            return False
+        await session.close()
+        return True
+
     async def close_all(self) -> None:
         for key in list(self._sessions):
             await self._sessions.pop(key).close()
