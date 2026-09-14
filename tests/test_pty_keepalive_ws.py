@@ -134,3 +134,31 @@ async def test_attach_token_reuses_default_chat_after_active_session_fallback(
         ws2.send_bytes(b"again")
 
     assert pty_keepalive_harness == [["x", "fresh"]]
+
+
+@pytest.mark.asyncio
+async def test_controller_can_close_a_keepalive_session_by_token(pty_keepalive_harness):
+    """A finished direct turn must be able to end its child instead of waiting for the reaper."""
+    from starlette.testclient import TestClient
+
+    client = TestClient(web_server.app)
+    headers = {web_server._SESSION_HEADER_NAME: web_server._SESSION_TOKEN}
+    with client.websocket_connect("/api/pty?attach=TOKC&profile=alpha&fresh=1") as ws:
+        ws.send_bytes(b"hi")
+    key = "TOKC\0alpha\0"
+    session = web_server.PTY_REGISTRY._sessions[key]
+    assert session.alive and not session.attached
+
+    response = client.delete("/api/pty/sessions/TOKC?profile=alpha", headers=headers)
+    assert response.status_code == 200 and response.json() == {"closed": True}
+    assert key not in web_server.PTY_REGISTRY._sessions
+    assert session.bridge.alive is False
+
+    # Idempotent: a second close (or an unknown token) is a clean "nothing to do".
+    response = client.delete("/api/pty/sessions/TOKC?profile=alpha", headers=headers)
+    assert response.status_code == 200 and response.json() == {"closed": False}
+    # A different profile is a different key and must not be closed by mistake.
+    with client.websocket_connect("/api/pty?attach=TOKD&profile=alpha&fresh=1"):
+        pass
+    assert client.delete("/api/pty/sessions/TOKD?profile=beta", headers=headers).json() == {"closed": False}
+    assert "TOKD\0alpha\0" in web_server.PTY_REGISTRY._sessions

@@ -18436,6 +18436,30 @@ async def pty_ws(ws: WebSocket) -> None:
         PTY_REGISTRY.detach(attach_token, ws)
 
 
+@app.delete("/api/pty/sessions/{attach}")
+async def pty_close_session(
+    attach: str,
+    profile: Optional[str] = None,
+    resume: Optional[str] = None,
+):
+    """Close a keep-alive PTY session by its attach token.
+
+    The keep-alive path (``/api/pty?attach=...``) lets a PTY outlive its socket
+    so a transient disconnect does not kill a turn in flight. The flip side is
+    that a controller which drove a turn to completion has no way to end the
+    child: the hosted TUI refuses /quit, /exit, Ctrl-C and Ctrl-D by design, so
+    the child idles until the TTL reaper. This endpoint is that way. The key is
+    composed exactly as ``pty_ws`` composes it, so the caller passes the same
+    ``attach`` and ``profile`` (and ``resume`` when it used one).
+    """
+    key = attach
+    if resume or profile:
+        key = f"{attach}\0{profile or ''}\0{resume or ''}"
+    closed = await PTY_REGISTRY.close(key)
+    _log.info("pty close requested attach=%s profile=%s closed=%s", attach[:12], profile, closed)
+    return {"closed": closed}
+
+
 # ---------------------------------------------------------------------------
 # /api/ws — JSON-RPC WebSocket sidecar for the dashboard "Chat" tab.
 #
