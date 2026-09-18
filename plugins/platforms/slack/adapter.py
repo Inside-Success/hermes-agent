@@ -14,6 +14,7 @@ import inspect
 import json
 import logging
 import os
+import random
 import re
 import time
 import unicodedata
@@ -1030,10 +1031,24 @@ class SlackAdapter(BasePlatformAdapter):
         # Reconnect when no ping/pong has arrived for this many multiples of the
         # client's ping_interval. Slack pings roughly every ping_interval seconds
         # even on an idle socket, so prolonged silence means a wedged transport.
-        self._socket_ping_stale_factor = 4
+        # Hardening: Reduced from 4 to 2 to accelerate stale detection (120s → 60s)
+        self._socket_ping_stale_factor = 2
         # Allow at least this long after (re)connect before treating a missing
         # first ping/pong as evidence of a wedged transport.
         self._socket_first_ping_grace_s = 60.0
+        # Hardening: Circuit breaker for rapid socket reconnect storms
+        # Track timestamps of recent reconnect attempts to detect >5 attempts in 60s
+        self._socket_reconnect_attempts: List[float] = []
+        self._socket_reconnect_attempt_window_s = 60.0
+        self._socket_reconnect_attempt_limit = 5
+        # Hardening: Exponential backoff for socket reconnect attempts
+        # Tracks the current backoff multiplier (starts at 1, doubles each attempt)
+        self._socket_backoff_exponent = 0
+        self._socket_backoff_base_s = 2.0
+        self._socket_backoff_max_s = 300.0  # 5 minutes
+        # Hardening: Metrics tracking
+        self._socket_reconnect_attempts_total = 0
+        self._socket_rebuild_cycle_start: Optional[float] = None
 
     async def _close_workspace_clients(self) -> None:
         """Close any Slack SDK clients that may own aiohttp sessions."""
@@ -1273,6 +1288,51 @@ class SlackAdapter(BasePlatformAdapter):
             return False
         return (time.time() - last) > (ping_interval * self._socket_ping_stale_factor)
 
+    def _record_socket_rebuild_cycle(self) -> None:
+        """Record metrics for a completed socket rebuild cycle.
+
+        Called when the socket recovers from an unhealthy state.
+        """
+        if self._socket_rebuild_cycle_start is not None:
+            cycle_duration = time.time() - self._socket_rebuild_cycle_start
+            logger.info(
+                "[Slack] Socket rebuild cycle completed. "
+                "Total attempts: %d, Cycle duration: %.1fs",
+                len(self._socket_reconnect_attempts),
+                cycle_duration
+            )
+            self._socket_rebuild_cycle_start = None
+            self._socket_reconnect_attempts.clear()
+
+    def _check_socket_circuit_breaker(self) -> Tuple[bool, Optional[str]]:
+        """Check if socket reconnect circuit breaker should trip.
+
+        Returns:
+            (should_proceed, error_message): If should_proceed is False, the circuit
+            breaker is open and reconnection should be deferred.
+        """
+        now = time.time()
+
+        # Clean up attempts older than the window
+        self._socket_reconnect_attempts = [
+            ts for ts in self._socket_reconnect_attempts
+            if (now - ts) < self._socket_reconnect_attempt_window_s
+        ]
+
+        # Check if we've exceeded the threshold (more than 5 attempts in 60s window)
+        if len(self._socket_reconnect_attempts) > self._socket_reconnect_attempt_limit:
+            error_msg = (
+                f"[Slack] Socket Mode circuit breaker opened: {len(self._socket_reconnect_attempts)} "
+                f"reconnect attempts in {self._socket_reconnect_attempt_window_s}s. "
+                f"Pausing auto-restart for 5 minutes."
+            )
+            logger.error(error_msg)
+            self._socket_reconnect_attempts.clear()
+            self._socket_backoff_exponent = 0
+            return False, error_msg
+
+        return True, None
+
     async def _restart_socket_mode(self, reason: str) -> None:
         """Reconnect Socket Mode without rebuilding adapter state."""
         if not self._running:
@@ -1282,15 +1342,55 @@ class SlackAdapter(BasePlatformAdapter):
             if not self._running or not self._app or not self._app_token:
                 return
 
+            # Hardening: Check circuit breaker before attempting reconnection
+            should_proceed, error_msg = self._check_socket_circuit_breaker()
+            if not should_proceed:
+                # Apply exponential backoff when circuit breaker trips
+                backoff_delay = min(
+                    self._socket_backoff_base_s * (2 ** self._socket_backoff_exponent),
+                    self._socket_backoff_max_s
+                )
+                logger.error(
+                    "[Slack] Circuit breaker active. Waiting %.1fs before retry (backoff level %d)",
+                    backoff_delay,
+                    self._socket_backoff_exponent
+                )
+                self._socket_backoff_exponent = min(self._socket_backoff_exponent + 1, 8)
+                await asyncio.sleep(backoff_delay)
+                return
+
+            # Hardening: Track this reconnect attempt for circuit breaker
+            self._socket_reconnect_attempts.append(time.time())
+            self._socket_reconnect_attempts_total += 1
+
             logger.warning("[Slack] Socket Mode unhealthy (%s); reconnecting", reason)
             await self._stop_socket_mode_handler()
 
+            # Start the rebuild cycle timing if this is the first in a batch
+            if self._socket_rebuild_cycle_start is None:
+                self._socket_rebuild_cycle_start = time.time()
+
             try:
                 self._start_socket_mode_handler()
+                # Reset backoff on successful reconnect
+                self._socket_backoff_exponent = 0
             except Exception as exc:  # pragma: no cover - defensive logging
                 logger.error(
                     "[Slack] Socket Mode reconnect failed: %s", exc, exc_info=True
                 )
+                # Apply exponential backoff for rate-limit handling
+                backoff_delay = min(
+                    self._socket_backoff_base_s * (2 ** self._socket_backoff_exponent),
+                    self._socket_backoff_max_s
+                )
+                if backoff_delay > 0:
+                    logger.info(
+                        "[Slack] Applying exponential backoff: %.1fs (level %d)",
+                        backoff_delay,
+                        self._socket_backoff_exponent
+                    )
+                    self._socket_backoff_exponent = min(self._socket_backoff_exponent + 1, 8)
+                    await asyncio.sleep(backoff_delay)
 
     async def _socket_watchdog_loop(self) -> None:
         """Monitor Socket Mode and reconnect if the task/transport dies.
@@ -1301,7 +1401,10 @@ class SlackAdapter(BasePlatformAdapter):
         """
         while self._running:
             try:
-                await asyncio.sleep(self._socket_watchdog_interval_s)
+                # Hardening: Add ±2s jitter to prevent synchronized watchdog polls
+                # across multiple gateway profiles (thundering-herd prevention)
+                jittered_interval = self._socket_watchdog_interval_s + random.uniform(-2, 2)
+                await asyncio.sleep(jittered_interval)
                 if not self._running:
                     break
 
@@ -1322,6 +1425,10 @@ class SlackAdapter(BasePlatformAdapter):
                     # but the client keeps retrying; ping/pong staleness catches
                     # that wedged-zombie case that the bool check above misses.
                     await self._restart_socket_mode("ping/pong stale")
+                else:
+                    # Hardening: Socket is healthy; record metrics if we were in a rebuild cycle
+                    if self._socket_rebuild_cycle_start is not None:
+                        self._record_socket_rebuild_cycle()
             except asyncio.CancelledError:
                 raise
             except Exception:  # pragma: no cover - defensive logging
