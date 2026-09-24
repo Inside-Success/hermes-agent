@@ -2006,7 +2006,11 @@ class SlackAdapter(BasePlatformAdapter):
                 user_agent_prefix=_HERMES_SLACK_USER_AGENT_PREFIX,
             )
             self._app = AsyncApp(token=primary_token, client=primary_client)
-            _apply_slack_proxy(self._app.client, proxy_url)
+
+            try:
+                _apply_slack_proxy(self._app.client, proxy_url)
+            except Exception as e:
+                logger.debug("[Slack] Could not apply proxy to AsyncApp client: %s", e)
 
             # Register each bot token and map team_id → client
             for token in bot_tokens:
