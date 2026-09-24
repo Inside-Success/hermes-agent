@@ -2001,8 +2001,11 @@ class SlackAdapter(BasePlatformAdapter):
 
             # First token is the primary — used for AsyncApp / Socket Mode
             primary_token = bot_tokens[0]
-            # Let AsyncApp manage its own session for proper lifecycle handling
-            self._app = AsyncApp(token=primary_token)
+            primary_client = AsyncWebClient(
+                token=primary_token,
+                user_agent_prefix=_HERMES_SLACK_USER_AGENT_PREFIX,
+            )
+            self._app = AsyncApp(token=primary_token, client=primary_client)
 
             try:
                 _apply_slack_proxy(self._app.client, proxy_url)
