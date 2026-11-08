@@ -186,6 +186,34 @@ def _persist_tool_api_content(agent, tool_messages: list) -> None:
             logger.exception("Final tool context persistence failed for %s", call_id)
 
 
+def _persist_tool_api_content_from_request(agent, request: dict, tool_call_ids: set) -> None:
+    """Capture text tool results from the final payload of each request attempt.
+
+    Provider envelopes differ, but string tool output remains a string. Do not
+    flatten multimodal output into a misleading text-only sidecar.
+    """
+    messages = request.get("messages", request.get("input", []))
+    if not isinstance(messages, list):
+        return
+    tool_messages = []
+    for message in messages:
+        if not isinstance(message, dict):
+            continue
+        if message.get("role") == "tool":
+            tool_messages.append(message)
+        elif message.get("type") == "function_call_output":
+            tool_messages.append({"role": "tool", "tool_call_id": message.get("call_id"),
+                                  "content": message.get("output")})
+        elif message.get("role") == "user" and isinstance(message.get("content"), list):
+            for block in message["content"]:
+                if isinstance(block, dict) and block.get("type") == "tool_result":
+                    tool_messages.append({"role": "tool", "tool_call_id": block.get("tool_use_id"),
+                                          "content": block.get("content")})
+    _persist_tool_api_content(agent, [
+        msg for msg in tool_messages if msg.get("tool_call_id") in tool_call_ids
+    ])
+
+
 def _ra():
     """Lazy reference to ``run_agent`` so patches like ``run_agent._set_interrupt`` work."""
     import run_agent
