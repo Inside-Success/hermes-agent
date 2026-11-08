@@ -1830,6 +1830,7 @@ def run_conversation(
         api_kwargs = None  # Guard against UnboundLocalError in except handler
         api_request_id = f"{turn_id}:api:{api_call_count}"
         agent._current_api_request_id = api_request_id
+        api_attempt_count = 0
 
         while retry_count < max_retries:
             # ── Nous Portal rate limit guard ──────────────────────
@@ -2053,17 +2054,65 @@ def run_conversation(
                         _use_streaming = False
 
                 def _perform_api_call(next_api_kwargs):
+                    nonlocal api_attempt_count
                     if agent.api_mode == "codex_responses":
                         next_api_kwargs = agent._get_transport().preflight_kwargs(
                             next_api_kwargs,
                             allow_stream=False,
                             is_github_responses=agent._is_copilot_url(),
                         )
-                    if _use_streaming:
-                        return agent._interruptible_streaming_api_call(
-                            next_api_kwargs, on_first_delta=_stop_spinner
-                        )
-                    return agent._interruptible_api_call(next_api_kwargs)
+                    # Retry recovery and execution middleware can transform
+                    # payloads after the initial API-message build. Backfill
+                    # from THIS attempt's final provider-shaped tool text.
+                    from agent.tool_executor import _persist_tool_api_content_from_request
+                    _persist_tool_api_content_from_request(agent, next_api_kwargs, _current_tool_ids)
+                    api_attempt_count += 1
+                    attempt_started = time.time()
+                    attempt_context = {
+                        "task_id": effective_task_id,
+                        "turn_id": turn_id,
+                        "api_request_id": api_request_id,
+                        "api_attempt_id": f"{api_request_id}:attempt:{api_attempt_count}",
+                        "session_id": agent.session_id or "",
+                        "platform": agent.platform or "",
+                        "model": agent.model,
+                        "provider": agent.provider,
+                        "base_url": agent.base_url,
+                        "api_mode": agent.api_mode,
+                        "api_call_count": api_call_count,
+                        "started_at": attempt_started,
+                        # Raw, unbounded source payload. Observers must copy
+                        # and redact synchronously; retry recovery may mutate
+                        # this object. SDK-internal retries and transport-only
+                        # stream/timeout options are outside this boundary.
+                        "request": next_api_kwargs,
+                    }
+
+                    def observe_attempt(event, **payload):
+                        try:
+                            from hermes_cli.plugins import has_hook, invoke_hook
+                            if has_hook(event):
+                                invoke_hook(event, **attempt_context, **payload)
+                        except Exception:
+                            logger.debug("Model attempt observer failed", exc_info=True)
+
+                    observe_attempt("pre_api_attempt")
+                    try:
+                        if _use_streaming:
+                            attempt_response = agent._interruptible_streaming_api_call(
+                                next_api_kwargs, on_first_delta=_stop_spinner
+                            )
+                        else:
+                            attempt_response = agent._interruptible_api_call(next_api_kwargs)
+                    except BaseException as exc:
+                        ended_at = time.time()
+                        observe_attempt("post_api_attempt", response=None, error=exc,
+                                        ended_at=ended_at, duration=ended_at - attempt_started)
+                        raise
+                    ended_at = time.time()
+                    observe_attempt("post_api_attempt", response=attempt_response, error=None,
+                                    ended_at=ended_at, duration=ended_at - attempt_started)
+                    return attempt_response
 
                 from hermes_cli.middleware import run_llm_execution_middleware
 
