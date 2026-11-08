@@ -1,0 +1,274 @@
+"""Opt-in complete model content at the Langfuse SDK boundary (no network)."""
+from __future__ import annotations
+
+import importlib
+import json
+import sys
+from types import SimpleNamespace
+
+import pytest
+import yaml
+
+
+class RecordingSpan:
+    def __init__(self, **kwargs):
+        self.started = kwargs
+        self.updates = []
+        self.children = []
+        self.ended = False
+
+    def start_observation(self, **kwargs):
+        span = RecordingSpan(**kwargs)
+        self.children.append(span)
+        return span
+
+    def update(self, **kwargs):
+        self.updates.append(kwargs)
+
+    def set_trace_io(self, **kwargs):
+        self.updates.append(kwargs)
+
+    def end(self):
+        self.ended = True
+
+    def __enter__(self):
+        return self
+
+
+class RecordingClient:
+    def __init__(self):
+        self.roots = []
+
+    def create_trace_id(self, seed):
+        return "0" * 32
+
+    def start_as_current_observation(self, **kwargs):
+        span = RecordingSpan(**kwargs)
+        self.roots.append(span)
+        return span
+
+    def flush(self):
+        pass
+
+
+@pytest.fixture
+def plugin(monkeypatch, tmp_path):
+    sys.modules.pop("plugins.observability.langfuse", None)
+    mod = importlib.import_module("plugins.observability.langfuse")
+    (tmp_path / "config.yaml").write_text(yaml.safe_dump({
+        "plugins": {"entries": {"observability/langfuse": {"full_content": True}}},
+    }))
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    hooks = {}
+    mod.register(SimpleNamespace(register_hook=lambda name, fn: hooks.setdefault(name, fn)))
+    client = RecordingClient()
+    monkeypatch.setattr(mod, "_get_langfuse", lambda: client)
+    monkeypatch.setattr(mod, "propagate_attributes", None)
+    return mod, client, hooks
+
+
+def attempt_kwargs(number=1):
+    return dict(task_id="task", session_id="session", turn_id="turn",
+                api_request_id="request", api_attempt_id=f"request:attempt:{number}",
+                api_call_count=1, model="synthetic-model", provider="synthetic")
+
+
+def test_full_request_reaches_sdk_without_preview_limits(plugin):
+    _, client, hooks = plugin
+    nested = {"level": {"level": {"level": {"level": {"complete": "end"}}}}}
+    messages = [{"role": "system", "content": "policy " + "s" * 15000}]
+    messages += [{"role": "user", "content": f"message {i}"} for i in range(15)]
+    messages += [{"role": "tool", "content": json.dumps({"items": list(range(75)), **nested})}]
+    request = {"messages": messages, "tools": [{"name": f"tool_{i}"} for i in range(75)]}
+    request["tools"][0]["parameters"] = {"type": "object", "properties": {
+        "api_key": {"type": "string", "description": "credential input"}, "run_token": {},
+    }}
+    request["messages"].append({"role": "user", "content": [
+        {"type": "image_url", "image_url": {"url": "data:image/png;base64," + "YQ==" * 5000}},
+    ]})
+    hooks["pre_api_attempt"](request=request, **attempt_kwargs())
+    generation = client.roots[0].children[0]
+    assert generation.started["input"] == request
+    assert generation.started["metadata"]["captured_scope"] == "hermes_dispatch_attempt"
+    assert generation.started["metadata"]["full_content"] is True
+    assert generation.started["metadata"]["redacted"] is True
+    # The SDK retains a snapshot, independent of provider retry mutations.
+    request["messages"][0]["content"] = "mutated"
+    assert generation.started["input"]["messages"][0]["content"].endswith("s" * 15000)
+
+
+def test_complete_answer_and_exposed_reasoning_reach_sdk(plugin):
+    _, client, hooks = plugin
+    hooks["pre_api_attempt"](request={"input": "question"}, **attempt_kwargs())
+    output = {"choices": [{"message": {"content": "a" * 16000,
+              "reasoning_content": "r" * 17000, "tool_calls": [{"id": str(i)} for i in range(75)]}}]}
+    response = SimpleNamespace(**output)
+    hooks["post_api_attempt"](response=response, error=None, api_duration=0.5, **attempt_kwargs())
+    generation = client.roots[0].children[0]
+    assert generation.updates[-1]["output"] == output
+    assert generation.ended
+
+
+def test_failed_and_successful_attempts_are_distinct(plugin):
+    _, client, hooks = plugin
+    hooks["pre_api_attempt"](request={"messages": [{"content": "unicode ☃"}]}, **attempt_kwargs())
+    hooks["post_api_attempt"](response=None, error=ValueError("invalid unicode"), **attempt_kwargs())
+    hooks["pre_api_attempt"](request={"messages": [{"content": "ascii"}]}, **attempt_kwargs(2))
+    hooks["post_api_attempt"](response={"content": "answer"}, error=None, **attempt_kwargs(2))
+    children = client.roots[0].children
+    assert len(children) == 2
+    assert children[0].started["input"]["messages"][0]["content"] == "unicode ☃"
+    assert children[0].updates[-1]["output"]["error"]["message"] == "invalid unicode"
+    assert children[0].ended and children[1].ended
+
+
+def test_credentials_redacted_in_prose_json_and_metadata(plugin, monkeypatch):
+    _, client, hooks = plugin
+    monkeypatch.setenv("SYNTHETIC_API_KEY", "opaque-credential-value")
+    request = {"messages": [{"role": "system", "content":
+        'Credential opaque-credential-value; run_token=unconfigured-run-credential; '
+        '{"run_token": "json-run-credential", "data": "kept"}'}],
+        "headers": {"Authorization": "Bearer header-credential"},
+        "extra": {"run_token": "structured-run-credential"}}
+    hooks["pre_api_attempt"](request=request, base_url="https://example.test/?token=url-credential",
+                              **attempt_kwargs())
+    serialized = json.dumps(client.roots[0].started) + json.dumps(client.roots[0].children[0].started)
+    for secret in ("opaque-credential-value", "unconfigured-run-credential", "json-run-credential",
+                   "header-credential", "structured-run-credential", "url-credential"):
+        assert secret not in serialized
+    assert "kept" in serialized
+
+
+def test_full_tool_result_preserves_read_file_and_all_items(plugin):
+    _, client, hooks = plugin
+    hooks["pre_api_attempt"](request={"messages": []}, **attempt_kwargs())
+    arguments = {"items": list(range(75))}
+    hooks["pre_tool_call"](tool_name="read_file", args=arguments, tool_call_id="tool", **attempt_kwargs())
+    result = {"content": "\n".join(f"{i}|line {i}" for i in range(1, 90)),
+              "total_lines": 89, "file_size": 15000, "is_binary": False, "is_image": False}
+    hooks["post_tool_call"](tool_name="read_file", args=arguments, result=json.dumps(result),
+                            tool_call_id="tool", **attempt_kwargs())
+    tool = client.roots[0].children[1]
+    assert tool.started["input"] == arguments
+    assert tool.updates[-1]["output"] == json.dumps(result)
+
+
+def test_full_mode_avoids_duplicate_preview_generation(plugin):
+    _, client, hooks = plugin
+    hooks["pre_api_request"](request_messages=[{"role": "user", "content": "preview"}], **attempt_kwargs())
+    assert not client.roots
+    hooks["pre_api_attempt"](request={"messages": []}, **attempt_kwargs())
+    hooks["post_api_request"](assistant_content_chars=10, **attempt_kwargs())
+    assert not client.roots[0].children[0].ended
+
+
+def test_default_config_keeps_preview_mode(tmp_path, monkeypatch):
+    sys.modules.pop("plugins.observability.langfuse", None)
+    mod = importlib.import_module("plugins.observability.langfuse")
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    hooks = {}
+    mod.register(SimpleNamespace(register_hook=lambda name, fn: hooks.setdefault(name, fn)))
+    client = RecordingClient()
+    monkeypatch.setattr(mod, "_get_langfuse", lambda: client)
+    monkeypatch.setattr(mod, "propagate_attributes", None)
+    hooks["pre_api_attempt"](request={"messages": []}, **attempt_kwargs())
+    assert not client.roots
+    hooks["pre_api_request"](request_messages=[{"role": "user", "content": str(i)} for i in range(15)],
+                             **attempt_kwargs())
+    assert len(client.roots[0].children[0].started["input"]) == 12
+
+
+def test_nested_json_credentials_and_public_key_data(plugin):
+    mod, _, _ = plugin
+    value = json.dumps({"arguments": json.dumps({"run_token": "nested-opaque-value", "key": "public-data"})})
+    safe = mod._full_value(value)
+    assert "nested-opaque-value" not in safe
+    assert json.loads(json.loads(safe)["arguments"])["key"] == "public-data"
+
+
+def test_attempt_usage_cost_and_turn_output_are_forwarded(plugin, monkeypatch):
+    mod, client, hooks = plugin
+    monkeypatch.setattr(mod, "_usage_and_cost", lambda *a, **k: ({"input": 123, "output": 45}, {"total": 0.01}))
+    hooks["pre_api_attempt"](request={"messages": []}, **attempt_kwargs())
+    hooks["post_api_attempt"](response={"content": "answer"}, duration=0.25, **attempt_kwargs())
+    update = client.roots[0].children[0].updates[-1]
+    assert update["usage_details"] == {"input": 123, "output": 45}
+    assert update["cost_details"] == {"total": 0.01}
+    assert update["metadata"]["duration_s"] == 0.25
+    hooks["post_llm_call"](task_id="task", session_id="session", turn_id="turn", assistant_response="a" * 16000)
+    assert client.roots[0].updates[-1]["output"] == "a" * 16000
+    assert client.roots[0].ended
+    assert not mod._TRACE_STATE
+
+
+def test_non_json_types_are_explicit_and_json_safe(plugin):
+    mod, _, _ = plugin
+    cycle = []
+    cycle.append(cycle)
+    safe = mod._full_value({"bytes": b"abc", "not_finite": float("nan"), "cycle": cycle})
+    json.dumps(safe, allow_nan=False)
+    assert safe["bytes"]["data"] == "YWJj"
+    assert safe["cycle"][0]["reason"] == "cyclic non-JSON value"
+
+
+def test_real_sdk_exports_complete_model_content(plugin, monkeypatch):
+    langfuse = pytest.importorskip("langfuse")
+    from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
+
+    mod, _, hooks = plugin
+    exporter = InMemorySpanExporter()
+    client = langfuse.Langfuse(public_key="pk-lf-test-full-content-sdk", secret_key="sk-lf-test",
+                              span_exporter=exporter, sample_rate=1.0)
+    monkeypatch.setattr(mod, "_get_langfuse", lambda: client)
+    monkeypatch.setenv("SYNTHETIC_API_KEY", "opaque-sdk-credential")
+    request = {"messages": [{"role": "system", "content": "s" * 15000}]
+               + [{"role": "tool", "content": json.dumps({"items": list(range(75)),
+                   "nested": {"a": {"b": {"c": {"d": {"e": "complete"}}}}}})} for _ in range(15)],
+               "tools": [{"name": f"tool_{i}"} for i in range(75)]}
+    request["headers"] = {"Authorization": "Bearer opaque-sdk-credential"}
+    expected_request = {**request, "headers": {"Authorization": "[REDACTED]"}}
+    response = {"choices": [{"message": {"content": "a" * 16000,
+                 "reasoning": "r" * 17000, "tool_calls": [{"id": str(i)} for i in range(75)]}}]}
+    try:
+        hooks["pre_api_attempt"](request=request, base_url="https://example.test/?token=opaque-url-credential",
+                                  **attempt_kwargs())
+        hooks["post_api_attempt"](response=SimpleNamespace(**response), error=None, **attempt_kwargs())
+        hooks["post_llm_call"](task_id="task", session_id="session", turn_id="turn",
+                               assistant_response="a" * 16000)
+        client.flush()
+        spans = exporter.get_finished_spans()
+        generation = next(span for span in spans if span.name.startswith("LLM attempt "))
+        assert json.loads(generation.attributes["langfuse.observation.input"]) == expected_request
+        assert json.loads(generation.attributes["langfuse.observation.output"]) == response
+        assert generation.attributes["langfuse.observation.metadata.captured_scope"] == "hermes_dispatch_attempt"
+        assert generation.attributes["langfuse.observation.metadata.redacted"] is True
+        assert "opaque-sdk-credential" not in json.dumps(dict(generation.attributes))
+        assert "opaque-url-credential" not in json.dumps(dict(generation.attributes))
+    finally:
+        client.shutdown()
+
+
+def test_real_plugin_manager_propagates_opt_in_and_attempt_hooks(tmp_path, monkeypatch):
+    from hermes_cli.plugins import PluginManager
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr("pathlib.Path.home", lambda: tmp_path)
+    (tmp_path / "config.yaml").write_text(yaml.safe_dump({"plugins": {
+        "enabled": ["observability/langfuse"],
+        "entries": {"observability/langfuse": {"full_content": True}},
+    }}))
+    manager = PluginManager()
+    manager.discover_and_load()
+    loaded = manager._plugins["observability/langfuse"]
+    assert loaded.enabled, loaded.error
+    client = RecordingClient()
+    monkeypatch.setattr(loaded.module, "_get_langfuse", lambda: client)
+    monkeypatch.setattr(loaded.module, "propagate_attributes", None)
+    assert manager.has_hook("pre_api_attempt") and manager.has_hook("post_api_attempt")
+    request = {"messages": [{"role": "system", "content": "s" * 15000}]}
+    manager.invoke_hook("pre_api_attempt", request=request, **attempt_kwargs())
+    manager.invoke_hook("post_api_attempt", response={"content": "answer"}, **attempt_kwargs())
+    manager.invoke_hook("post_llm_call", task_id="task", session_id="session", turn_id="turn",
+                        assistant_response="answer")
+    assert client.roots[0].children[0].started["input"] == request
+    assert client.roots[0].ended
