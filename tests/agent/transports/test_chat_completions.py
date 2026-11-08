@@ -15,6 +15,17 @@ def transport():
 
 class TestChatCompletionsBasic:
 
+    @pytest.mark.parametrize("role,sent", [("tool", "sent"), ("tool", ""), ("user", "sent"), ("assistant", "sent")])
+    def test_build_kwargs_substitutes_api_content(self, transport, role, sent):
+        original = {"role": role, "content": "raw", "api_content": sent}
+        if role == "tool":
+            original["tool_call_id"] = "call"
+        kwargs = transport.build_kwargs(model="test", messages=[original], tools=[])
+        assert kwargs["messages"][0]["content"] == sent
+        assert "api_content" not in kwargs["messages"][0]
+        assert original["content"] == "raw"
+        assert original["api_content"] == sent
+
     def test_api_mode(self, transport):
         assert transport.api_mode == "chat_completions"
 

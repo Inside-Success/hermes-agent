@@ -620,6 +620,57 @@ def _user_messages(req: dict) -> list:
 
 
 class TestWireInvariant:
+    def test_retry_sidecar_matches_ascii_fallback_request(self, wire_env):
+        from copy import deepcopy
+        make_agent, handler, db, sid = wire_env
+        agent = make_agent()
+        agent.valid_tool_names = {"search_files"}
+        raw = "Café evidence"
+        handler.response_queue.extend([_tc_resp("search_files"), _text_resp("done")])
+        original_call = agent._interruptible_streaming_api_call
+        failures = []
+        attempts = []
+
+        def capture_attempt(event, **payload):
+            if event in {"pre_api_attempt", "post_api_attempt"}:
+                snapshot = dict(payload)
+                snapshot["request"] = deepcopy(payload["request"])
+                attempts.append((event, snapshot))
+            return []
+
+        def fail_once_with_tool(kwargs, **options):
+            if not failures and any(m.get("role") == "tool" for m in kwargs.get("messages", [])):
+                failures.append(True)
+                raise UnicodeEncodeError("ascii", raw, 3, 4, "test encoding failure")
+            return original_call(kwargs, **options)
+
+        with patch("run_agent.handle_function_call", return_value=raw), \
+             patch.object(agent, "_invoke_tool", return_value=raw), \
+             patch.object(agent, "_interruptible_streaming_api_call", side_effect=fail_once_with_tool), \
+             patch("hermes_cli.plugins.has_hook", side_effect=lambda event: event in {"pre_api_attempt", "post_api_attempt"}), \
+             patch("hermes_cli.plugins.invoke_hook", side_effect=capture_attempt):
+            agent.run_conversation("read evidence", conversation_history=[], task_id="t")
+        assert len(failures) == 1
+        request = _chat_requests(handler)[-1]
+        sent = next(m for m in request["messages"] if m["role"] == "tool")["content"]
+        assert sent == "Caf evidence"
+        row = next(r for r in db.get_messages(sid) if r["role"] == "tool")
+        assert row["content"] == raw
+        assert row["api_content"] == sent
+        before = [p for event, p in attempts if event == "pre_api_attempt"]
+        after = [p for event, p in attempts if event == "post_api_attempt"]
+        assert len(before) == len(after) == 3
+        assert len({p["api_attempt_id"] for p in before}) == 3
+        assert [p["api_attempt_id"] for p in before] == [p["api_attempt_id"] for p in after]
+        assert isinstance(after[1]["error"], UnicodeEncodeError)
+        assert after[1]["response"] is None
+        assert after[2]["error"] is None
+        assert after[2]["response"] is not None
+        failed_tool = next(m for m in before[1]["request"]["messages"] if m["role"] == "tool")
+        retried_tool = next(m for m in before[2]["request"]["messages"] if m["role"] == "tool")
+        assert failed_tool["content"] == raw
+        assert retried_tool["content"] == sent
+
     @pytest.mark.parametrize("late_steer", [False, True])
     def test_tool_sidecar_matches_final_normalized_request(self, wire_env, late_steer):
         make_agent, handler, db, sid = wire_env

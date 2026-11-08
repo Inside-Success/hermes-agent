@@ -1,9 +1,30 @@
 """Post-budget tool input must survive persistence and replay."""
 
 from types import SimpleNamespace
+import pytest
 
 from agent.turn_context import substitute_api_content
 from hermes_state import SessionDB
+
+
+@pytest.mark.parametrize("payload", [
+    {"messages": [{"role": "tool", "tool_call_id": "call", "content": "sent"}]},
+    {"input": [{"type": "function_call_output", "call_id": "call", "output": "sent"}]},
+    {"messages": [{"role": "user", "content": [{"type": "tool_result", "tool_use_id": "call", "content": "sent"}]}]},
+])
+def test_request_capture_uses_provider_tool_envelope(tmp_path, payload):
+    from agent.tool_executor import _persist_tool_api_content_from_request
+    db = SessionDB(tmp_path / "state.db")
+    db.create_session("s", "test")
+    db.append_message("s", "tool", "raw", tool_call_id="call")
+    agent = SimpleNamespace(_session_db=db, session_id="s")
+    _persist_tool_api_content_from_request(agent, payload, set())
+    assert db.get_messages("s")[0]["api_content"] is None
+    _persist_tool_api_content_from_request(agent, payload, {"call"})
+    row = db.get_messages("s")[0]
+    assert row["content"] == "raw"
+    assert row["api_content"] == "sent"
+    db.close()
 
 
 def test_tool_sidecar_is_used_by_api_message_builder():

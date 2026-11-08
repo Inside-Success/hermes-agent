@@ -603,6 +603,8 @@ Each hook is documented in full on the **[Event Hooks reference](/user-guide/fea
 | [`post_tool_call`](/user-guide/features/hooks#post_tool_call) | After any tool returns | `tool_name: str, args: dict, result: str, task_id: str, duration_ms: int` | ignored |
 | [`pre_llm_call`](/user-guide/features/hooks#pre_llm_call) | Once per turn, before the tool-calling loop | `session_id: str, user_message: str, conversation_history: list, is_first_turn: bool, model: str, platform: str` | [context injection](#pre_llm_call-context-injection) |
 | [`post_llm_call`](/user-guide/features/hooks#post_llm_call) | Once per turn, after the tool-calling loop (successful turns only) | `session_id: str, user_message: str, assistant_response: str, conversation_history: list, model: str, platform: str` | ignored |
+| `pre_api_attempt` | Each Hermes model dispatch, after execution middleware and provider preflight | `api_attempt_id: str, request: dict, **kwargs` | ignored |
+| `post_api_attempt` | That dispatch returns or raises | `api_attempt_id: str, request: dict, response: object \| None, error: BaseException \| None, **kwargs` | ignored |
 | [`on_session_start`](/user-guide/features/hooks#on_session_start) | New session created (first turn only) | `session_id: str, model: str, platform: str` | ignored |
 | [`on_session_end`](/user-guide/features/hooks#on_session_end) | End of every `run_conversation` call + CLI exit | `session_id: str, completed: bool, interrupted: bool, model: str, platform: str` | ignored |
 | [`on_session_finalize`](/user-guide/features/hooks#on_session_finalize) | CLI/gateway tears down an active session | `session_id: str \| None, platform: str` | ignored |
@@ -614,6 +616,10 @@ Each hook is documented in full on the **[Event Hooks reference](/user-guide/fea
 Most hooks are fire-and-forget observers — their return values are ignored. The exception is `pre_llm_call`, which can inject context into the conversation.
 
 All callbacks should accept `**kwargs` for forward compatibility. If a hook callback crashes, it's logged and skipped. Other hooks and the agent continue normally.
+
+The attempt observers carry unbounded source objects. Copy and redact them synchronously before retaining or exporting them: retry recovery can mutate the request after the callback returns. These hooks do not inherit the sanitized previews of `pre_api_request` and `post_api_request`, whose behavior is unchanged. The response is the returned SDK object or assembled streaming response, including only reasoning the provider exposes.
+
+Both events include `task_id`, `turn_id`, `api_request_id`, `session_id`, `platform`, `model`, `provider`, `base_url`, `api_mode`, `api_call_count`, and `started_at`. The post event also includes `ended_at` and `duration` in seconds. `api_attempt_id` adds a monotonically increasing attempt suffix to the request ID, so an error and its later retry remain separate observations. These are Hermes dispatch attempts, not HTTP transport captures: SDK-internal retries and transport-only streaming/timeout options are outside this boundary.
 
 The kanban lifecycle hooks fire **after** the board DB change commits, so a callback always sees durable state and can never hold the SQLite write lock. Because kanban workers run as separate `hermes -p <profile> chat -q` subprocesses, `kanban_task_claimed` fires in the **dispatcher** process while `kanban_task_completed` / `kanban_task_blocked` fire in the **worker** process — hook in the dispatcher to observe every transition centrally, or in the worker for per-task in-session context.
 

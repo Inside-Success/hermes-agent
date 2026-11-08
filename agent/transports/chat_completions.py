@@ -16,6 +16,7 @@ from agent.moonshot_schema import is_moonshot_model, sanitize_moonshot_tools
 from agent.prompt_builder import DEVELOPER_ROLE_MODELS
 from agent.transports.base import ProviderTransport
 from agent.transports.types import NormalizedResponse, ToolCall, Usage
+from agent.turn_context import substitute_api_content
 
 
 def _reasoning_config_for_model(model: str, reasoning_config: dict | None) -> dict | None:
@@ -238,7 +239,7 @@ class ChatCompletionsTransport(ProviderTransport):
                 out_msg.pop("tool_name", None)
                 out_msg.pop("effect_disposition", None)
                 out_msg.pop("timestamp", None)  # #47868 — leak into strict providers
-                out_msg.pop("api_content", None)  # persist-what-you-send sidecar
+                substitute_api_content(out_msg)
 
 
             # Drop all Hermes-internal scaffolding markers (``_``-prefixed).
