@@ -72,6 +72,9 @@ retention are appropriate for those contents. Credential fields, known secret
 environment values, credential assignments in text/JSON, and URL credentials are
 redacted before export; redaction is enforced even if log redaction is disabled.
 This is credential filtering, not general personal-data removal.
+Credential-named schema properties keep their definitions; credential defaults,
+constants and examples are filtered as values. Encoded JSON string layers are
+checked recursively, while non-secret strings retain their original formatting.
 
 Full mode records separate generations for every **Hermes dispatch attempt**,
 including failed attempts and retries, through `pre_api_attempt` and

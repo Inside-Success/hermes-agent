@@ -74,7 +74,8 @@ _READ_FILE_TAIL_LINES = 15
 # Credential syntax, not prose classification. Also catches opaque run tokens
 # embedded in instructions and JSON-encoded tool arguments.
 _SECRET_ASSIGNMENT_RE = re.compile(
-    r"(\b(?:[a-z0-9]+[_-])*(?:api[ _-]?key|run[ _-]?tokens?|access[ _-]?token|"
+    r"(\b(?:[a-z0-9]+[_-])*(?:api[ _-]?key|secret[ _-]?key|access[ _-]?key(?:[ _-]?id)?|"
+    r"private[ _-]?key|run[ _-]?tokens?|access[ _-]?token|"
     r"refresh[ _-]?token|token|secret|password|passwd|credential|authorization|cookie)"
     r"\b[\"']?\s*[:=]\s*)(?:Bearer\s+|Basic\s+|Token\s+)?"
     r'''("(?:\\.|[^"\\])*"|'[^']*'|[^\s,;"'}\]]+)''',
@@ -83,13 +84,26 @@ _SECRET_ASSIGNMENT_RE = re.compile(
 
 
 def _sensitive_content_key(key: Any) -> bool:
-    name = str(key).casefold().replace("-", "_")
+    # Accept standard snake/kebab/camel credential names without classifying
+    # token counts, usage buckets, or arbitrary fields containing "key".
+    name = re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", str(key)).casefold().replace("-", "_")
     return name in {
         "api_key", "apikey", "authorization", "proxy_authorization", "cookie", "set_cookie",
         "password", "passwd", "secret", "token", "run_tokens", "private_key",
         "credential", "credentials", "auth", "bearer", "secret_value", "raw_secret",
-        "secret_input", "key_material",
-    } or name.endswith(("_api_key", "_token", "_secret", "_password", "_credentials", "_private_key"))
+        "secret_input", "key_material", "secret_key", "access_key", "access_key_id",
+    } or name.endswith(("_api_key", "_token", "_secret", "_password", "_passwd", "_credential",
+                         "_credentials", "_private_key", "_secret_key", "_access_key", "_access_key_id"))
+
+
+_SCHEMA_ROOT_KEYS = {"parameters", "input_schema", "json_schema", "schema"}
+_SCHEMA_MAP_KEYS = {"properties", "patternProperties", "$defs", "definitions", "dependentSchemas",
+                    "dependencies", "dependentRequired"}
+_SCHEMA_NODE_KEYS = {"items", "additionalItems", "additionalProperties", "unevaluatedItems",
+                     "unevaluatedProperties", "contains", "not", "if", "then", "else", "propertyNames",
+                     "anyOf", "oneOf", "allOf", "prefixItems"}
+_SCHEMA_MARKERS = {"type", "$ref", "$dynamicRef"} | _SCHEMA_MAP_KEYS | _SCHEMA_NODE_KEYS
+_SCHEMA_VALUE_KEYS = {"default", "const", "enum", "examples", "example"}
 
 
 def _full_value(value: Any) -> Any:
@@ -110,7 +124,7 @@ def _full_value(value: Any) -> Any:
         # Tool arguments/results can themselves contain JSON strings, including
         # further JSON-encoded strings. Preserve original bytes when unchanged;
         # parse recursively only to remove credential fields at every level.
-        if text.lstrip().startswith(("{", "[")):
+        if text.lstrip().startswith(("{", "[", '"')):
             try:
                 parsed = json.loads(text)
             except (ValueError, TypeError):
@@ -127,7 +141,8 @@ def _full_value(value: Any) -> Any:
         )
         return redact_sensitive_text(text, force=True, redact_url_credentials=True)
 
-    def copy(item: Any, *, schema: bool = False) -> Any:
+    def copy(item: Any, *, schema: bool = False, schema_map: bool = False,
+             credential_schema: bool = False) -> Any:
         if item is None or isinstance(item, (bool, int)):
             return item
         if isinstance(item, float):
@@ -143,17 +158,33 @@ def _full_value(value: Any) -> Any:
         try:
             if isinstance(item, dict):
                 # JSON Schema property names describe future values; they are
-                # part of the model's tool contract, not credential values.
-                return {text_value(str(k)): "[REDACTED]"
-                        if _sensitive_content_key(k) and not schema
-                        else copy(v, schema=schema or (
-                            k in {"parameters", "input_schema", "json_schema", "schema"}
-                            and isinstance(v, dict)
-                            and any(field in v for field in ("type", "properties", "$ref", "anyOf", "oneOf", "allOf"))
-                        ))
-                        for k, v in item.items()}
+                # part of the tool contract. Their defaults/examples are DATA,
+                # so a schema context must never exempt them from redaction.
+                result = {}
+                for key, val in item.items():
+                    safe_key = text_value(str(key))
+                    if schema_map:
+                        safe_val = copy(val, schema=True, credential_schema=_sensitive_content_key(key))
+                    elif schema:
+                        if key in _SCHEMA_VALUE_KEYS:
+                            safe_val = "[REDACTED]" if credential_schema else copy(val)
+                        elif key in _SCHEMA_MAP_KEYS:
+                            safe_val = copy(val, schema_map=True)
+                        elif key in _SCHEMA_NODE_KEYS:
+                            safe_val = copy(val, schema=True, credential_schema=credential_schema)
+                        elif _sensitive_content_key(key):
+                            safe_val = "[REDACTED]"
+                        else:
+                            safe_val = copy(val)
+                    elif _sensitive_content_key(key):
+                        safe_val = "[REDACTED]"
+                    else:
+                        is_schema = key in _SCHEMA_ROOT_KEYS and isinstance(val, dict) and bool(_SCHEMA_MARKERS & val.keys())
+                        safe_val = copy(val, schema=is_schema)
+                    result[safe_key] = safe_val
+                return result
             if isinstance(item, (list, tuple, set)):
-                return [copy(v, schema=schema) for v in item]
+                return [copy(v, schema=schema, credential_schema=credential_schema) for v in item]
             if isinstance(item, BaseException):
                 return {"type": type(item).__name__, "message": text_value(str(item))}
             if callable(getattr(item, "model_dump", None)):
