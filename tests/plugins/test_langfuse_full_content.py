@@ -211,6 +211,18 @@ def test_non_json_types_are_explicit_and_json_safe(plugin):
     assert safe["cycle"][0]["reason"] == "cyclic non-JSON value"
 
 
+def test_credential_key_variants_preserve_usage_and_schema_definitions(plugin):
+    mod, _, _ = plugin
+    controls = {"input_tokens": 12, "output_tokens": 5, "reasoning_tokens": 3,
+                "max_tokens": 200, "token_count": 17, "key": "public-data"}
+    value = {**controls, "secretKey": "opaque-value", "AWS_SECRET_ACCESS_KEY": "other-value",
+             "schema": {"$defs": {"api_key": {"type": "string", "description": "Input definition"}}}}
+    safe = mod._full_value(value)
+    assert all(safe[key] == val for key, val in controls.items())
+    assert safe["secretKey"] == safe["AWS_SECRET_ACCESS_KEY"] == "[REDACTED]"
+    assert safe["schema"] == value["schema"]
+
+
 def test_real_sdk_exports_complete_model_content(plugin, monkeypatch):
     langfuse = pytest.importorskip("langfuse")
     from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
@@ -225,6 +237,12 @@ def test_real_sdk_exports_complete_model_content(plugin, monkeypatch):
                + [{"role": "tool", "content": json.dumps({"items": list(range(75)),
                    "nested": {"a": {"b": {"c": {"d": {"e": "complete"}}}}}})} for _ in range(15)],
                "tools": [{"name": f"tool_{i}"} for i in range(75)]}
+    formatted_json = json.dumps({"caption": "café", "token_count": 42, "values": [1, 2]},
+                                indent=2, ensure_ascii=True)
+    request["messages"].extend([
+        {"role": "tool", "content": formatted_json},
+        {"role": "tool", "content": json.dumps(formatted_json)},
+    ])
     request["headers"] = {"Authorization": "Bearer opaque-sdk-credential"}
     expected_request = {**request, "headers": {"Authorization": "[REDACTED]"}}
     response = {"choices": [{"message": {"content": "a" * 16000,
@@ -272,3 +290,46 @@ def test_real_plugin_manager_propagates_opt_in_and_attempt_hooks(tmp_path, monke
                         assistant_response="answer")
     assert client.roots[0].children[0].started["input"] == request
     assert client.roots[0].ended
+
+
+@pytest.mark.parametrize("case", ["secret_key", "environment_access_key", "encoded_json_string",
+                                  "credential_property_default", "schema_object_default"])
+def test_real_sdk_excludes_credentials_in_each_source_shape(plugin, monkeypatch, case):
+    langfuse = pytest.importorskip("langfuse")
+    from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
+
+    mod, _, hooks = plugin
+    secret = f"synthetic-opaque-{case}-credential"
+    if case == "secret_key":
+        request = {"secret_key": secret}
+    elif case == "environment_access_key":
+        monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", secret)
+        request = {"messages": [{"role": "system", "content": f"Use {secret} for this call."}]}
+    elif case == "encoded_json_string":
+        request = {"messages": [{"role": "tool", "content": json.dumps(json.dumps({"run_token": secret}))}]}
+    elif case == "credential_property_default":
+        request = {"tools": [{"function": {"parameters": {"type": "object", "properties": {
+            "api_key": {"type": "string", "description": "Credential input", "default": secret},
+        }}}}]}
+    else:
+        request = {"tools": [{"function": {"parameters": {"type": "object", "default": {"token": secret}}}}]}
+    exporter = InMemorySpanExporter()
+    client = langfuse.Langfuse(public_key=f"pk-lf-test-credential-{case}", secret_key="sk-lf-test",
+                              span_exporter=exporter, sample_rate=1.0)
+    monkeypatch.setattr(mod, "_get_langfuse", lambda: client)
+    try:
+        hooks["pre_api_attempt"](request=request, **attempt_kwargs())
+        hooks["post_api_attempt"](response={"content": "safe answer"}, **attempt_kwargs())
+        hooks["post_llm_call"](task_id="task", session_id="session", turn_id="turn",
+                               assistant_response="safe answer")
+        client.flush()
+        spans = exporter.get_finished_spans()
+        generation = next(span for span in spans if span.name.startswith("LLM attempt "))
+        assert secret not in json.dumps(dict(generation.attributes))
+        assert "[REDACTED]" in generation.attributes["langfuse.observation.input"]
+        if case == "credential_property_default":
+            captured = json.loads(generation.attributes["langfuse.observation.input"])
+            prop = captured["tools"][0]["function"]["parameters"]["properties"]["api_key"]
+            assert prop["type"] == "string" and prop["description"] == "Credential input"
+    finally:
+        client.shutdown()
