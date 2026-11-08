@@ -140,6 +140,7 @@ def _flush_session_db_after_tool_progress(
     messages: list,
     *,
     stage: str,
+    raw_tool_content: str | None = None,
 ) -> None:
     """Best-effort incremental SessionDB flush for tool-call progress.
 
@@ -149,9 +150,40 @@ def _flush_session_db_after_tool_progress(
     transcript survives destructive-but-valid tool calls.
     """
     try:
-        agent._flush_messages_to_session_db(messages)
+        if raw_tool_content is not None and messages:
+            agent._flush_messages_to_session_db(
+                messages,
+                tool_content_overrides={messages[-1]["tool_call_id"]: raw_tool_content},
+            )
+        else:
+            agent._flush_messages_to_session_db(messages)
     except Exception as exc:
         logger.warning("Incremental tool-call persistence failed after %s: %s", stage, exc)
+
+
+def _persist_tool_api_content(agent, tool_messages: list) -> None:
+    """Backfill final model input after progress flush, budgets and steer.
+
+    Reuse SessionDB's api_content sidecar; raw tool results remain available
+    in content. Failures remain visible rather than implying a complete trace.
+    """
+    db = getattr(agent, "_session_db", None)
+    if db is None or getattr(agent, "_persist_disabled", False):
+        return
+    for msg in tool_messages:
+        if msg.get("role") != "tool" or not isinstance(msg.get("content"), str):
+            continue
+        call_id = msg.get("tool_call_id")
+        if not call_id:
+            continue
+        # A loaded sidecar must never override newly budgeted/steered content.
+        msg.pop("api_content", None)
+        try:
+            updated = db.set_tool_api_content(agent.session_id, call_id, msg["content"])
+            if updated != 1:
+                logger.warning("Final tool context has no durable row for %s", call_id)
+        except Exception:
+            logger.exception("Final tool context persistence failed for %s", call_id)
 
 
 def _ra():
@@ -974,6 +1006,7 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
             except Exception as cb_err:
                 logging.debug(f"Tool complete callback error: {cb_err}")
 
+        raw_tool_result = function_result
         function_result = maybe_persist_tool_result(
             content=function_result,
             tool_name=name,
@@ -1028,6 +1061,8 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
             agent,
             messages,
             stage=f"tool result {name}",
+            raw_tool_content=(raw_tool_result if isinstance(raw_tool_result, str)
+                              and raw_tool_result != function_result else None),
         )
 
         # ── Per-tool /steer drain ───────────────────────────────────
@@ -1047,6 +1082,7 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
     # so the steer marker is never truncated. See steer() for details.
     if finalize and num_tools > 0:
         agent._apply_pending_steer_to_tool_results(messages, num_tools)
+        _persist_tool_api_content(agent, messages[-num_tools:])
 
 
 
@@ -1671,6 +1707,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
             except Exception as cb_err:
                 logging.debug(f"Tool complete callback error: {cb_err}")
 
+        raw_tool_result = function_result
         function_result = maybe_persist_tool_result(
             content=function_result,
             tool_name=function_name,
@@ -1713,6 +1750,8 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
             agent,
             messages,
             stage=f"tool result {function_name}",
+            raw_tool_content=(raw_tool_result if isinstance(raw_tool_result, str)
+                              and raw_tool_result != function_result else None),
         )
 
         # ── Per-tool /steer drain ───────────────────────────────────
@@ -1761,6 +1800,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
     # applied to sequential execution as well.
     if finalize and num_tools_seq > 0:
         agent._apply_pending_steer_to_tool_results(messages, num_tools_seq)
+        _persist_tool_api_content(agent, messages[-num_tools_seq:])
 
 
 
@@ -1818,6 +1858,7 @@ def execute_tool_calls_segmented(agent, assistant_message, messages: list, effec
             config=_tool_budget,
         )
         agent._apply_pending_steer_to_tool_results(messages, total_tools)
+        _persist_tool_api_content(agent, messages[-total_tools:])
 
 
 __all__ = [

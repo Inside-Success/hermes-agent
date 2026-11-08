@@ -6637,6 +6637,26 @@ class SessionDB:
 
         return self._execute_write(_do)
 
+    def set_tool_api_content(self, session_id: str, tool_call_id: str, api_content: str) -> int:
+        """Record final tool input without overwriting the durable raw result.
+
+        Progress flushes precede aggregate budgets and steer injection. Update
+        only the latest active result for this call in this session, leaving
+        archived history and the original content intact.
+        """
+        sent = _scrub_surrogates(api_content)
+
+        def _do(conn):
+            cursor = conn.execute(
+                "UPDATE messages SET api_content = ? "
+                "WHERE id = (SELECT id FROM messages WHERE session_id = ? "
+                "AND role = 'tool' AND tool_call_id = ? AND active = 1 ORDER BY id DESC LIMIT 1)",
+                (sent, session_id, tool_call_id),
+            )
+            return cursor.rowcount
+
+        return self._execute_write(_do)
+
     def set_latest_user_api_content(
         self, session_id: str, content: Any, api_content: str
     ) -> int:
@@ -7106,7 +7126,7 @@ class SessionDB:
             # path substitutes it for content to keep the provider prompt
             # cache prefix byte-stable across turns. Cleaning it here would
             # re-introduce the divergence it exists to remove.
-            if row["api_content"]:
+            if row["api_content"] is not None:
                 msg["api_content"] = row["api_content"]
             if row["display_kind"]:
                 msg["display_kind"] = row["display_kind"]

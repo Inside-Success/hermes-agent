@@ -65,6 +65,36 @@ def _patch_mcp_server():
 class TestStructuredContentPreservation:
     """Ensure structuredContent from CallToolResult is forwarded."""
 
+    def test_exact_duplicate_json_is_sent_once(self, _patch_mcp_server):
+        payload = {"quote": "Dated evidence", "version": "v2", "confidence": None}
+        text = json.dumps(payload, indent=2)
+        _patch_mcp_server.call_tool = AsyncMock(return_value=_FakeCallToolResult(
+            content=[_FakeContentBlock(text)], structuredContent=payload,
+        ))
+        handler = mcp_tool._make_tool_handler("test-server", "my-tool", 30.0)
+        assert json.loads(handler({})) == {"result": text}
+
+    @pytest.mark.parametrize("text,payload", [
+        ('{"value": true}', {"value": 1}),
+        ('{"value": 1}', {"value": 1, "version": "v2"}),
+        ('not JSON', {"value": 1}),
+    ])
+    def test_distinct_structured_payload_is_preserved(self, _patch_mcp_server, text, payload):
+        _patch_mcp_server.call_tool = AsyncMock(return_value=_FakeCallToolResult(
+            content=[_FakeContentBlock(text)], structuredContent=payload,
+        ))
+        handler = mcp_tool._make_tool_handler("test-server", "my-tool", 30.0)
+        assert json.loads(handler({})) == {"result": text, "structuredContent": payload}
+
+    def test_multiple_blocks_keep_structured_payload(self, _patch_mcp_server):
+        payload = {"value": 1}
+        _patch_mcp_server.call_tool = AsyncMock(return_value=_FakeCallToolResult(
+            content=[_FakeContentBlock(json.dumps(payload)), _FakeContentBlock("")],
+            structuredContent=payload,
+        ))
+        handler = mcp_tool._make_tool_handler("test-server", "my-tool", 30.0)
+        assert json.loads(handler({}))["structuredContent"] == payload
+
     def test_text_only_result(self, _patch_mcp_server):
         """When no structuredContent, result is text-only (existing behaviour)."""
         session = _patch_mcp_server

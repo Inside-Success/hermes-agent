@@ -24,6 +24,7 @@ import sys
 import tempfile
 import threading
 import types
+from pathlib import Path
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from unittest.mock import MagicMock, patch
 
@@ -32,6 +33,11 @@ import pytest
 from agent.memory_manager import build_memory_context_block
 from agent.turn_context import build_turn_context, compose_user_api_content
 from hermes_state import SessionDB
+from tests.tools.test_mcp_structured_content import (
+    _FakeCallToolResult,
+    _FakeContentBlock,
+    _patch_mcp_server,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -453,6 +459,90 @@ def _text_resp(text: str) -> dict:
     }
 
 
+def test_reloaded_tool_sidecar_reaches_actual_request(wire_env):
+    make_agent, handler, db, sid = wire_env
+    db.create_session(sid, source="cli")
+    db.append_message(sid, "user", "question")
+    db.append_message(sid, "assistant", "", tool_calls=[{
+        "id": "call_1", "type": "function",
+        "function": {"name": "read_file", "arguments": "{}"},
+    }])
+    db.append_message(sid, "tool", "raw large result", tool_call_id="call_1", tool_name="read_file",
+                      api_content="actual post-budget result")
+    db.append_message(sid, "assistant", "prior answer")
+    agent = make_agent()
+    agent.run_conversation("continue", conversation_history=db.get_messages_as_conversation(sid))
+    request = next(r for r in handler.captured_requests if "messages" in r)
+    tools = [m for m in request["messages"] if m["role"] == "tool"]
+    assert len(tools) == 1
+    assert tools[0]["content"] == "actual post-budget result"
+    assert tools[0]["tool_call_id"] == "call_1"
+    assert "api_content" not in tools[0]
+
+
+def test_private_batch_preserves_all_evidence_on_wire(wire_env, _patch_mcp_server):
+    """Opt-in replay of redacted private evidence, never shipped in git."""
+    fixture = Path(__file__).parents[2] / ".scratch/tool-result-batch.json"
+    if not fixture.exists():
+        pytest.skip("private incident fixture is not installed")
+    from copy import deepcopy
+    from unittest.mock import AsyncMock
+    from agent.tool_dispatch_helpers import make_tool_result_message
+    from agent.tool_executor import execute_tool_calls_segmented
+    from tools.tool_result_storage import enforce_turn_budget
+    from tools.mcp_tool import _make_tool_handler
+
+    original = json.loads(fixture.read_text())
+    assert len(original) > 1
+    before = deepcopy(original)
+    enforce_turn_budget(before, env=None)
+    # The unchanged old budget code still demonstrates the incident on the
+    # original duplicated payload, so this is not a hand-authored substitute.
+    assert any(a["content"] != b["content"] for a, b in zip(before, original))
+
+    make_agent, handler, db, sid = wire_env
+    agent = make_agent()
+    db.create_session(sid, source="cli")
+    db.append_message(sid, "user", "read evidence")
+    calls = [{"id": row["tool_call_id"], "type": "function", "function": {
+        "name": row["tool_name"], "arguments": "{}"}} for row in original]
+    db.append_message(sid, "assistant", "", tool_calls=calls)
+    messages = []
+    for row in original:
+        content = row["content"]
+        payload = json.loads(content[content.index("{"):content.rindex("}") + 1])
+        text_result = payload["result"]
+        _patch_mcp_server.call_tool = AsyncMock(return_value=_FakeCallToolResult(
+            content=[_FakeContentBlock(text_result)] if isinstance(text_result, str) else [],
+            structuredContent=payload.get("structuredContent") if isinstance(text_result, str) else text_result,
+        ))
+        adapted = _make_tool_handler("test-server", "incident-tool", 30)({})
+        rendered = json.loads(adapted)
+        # Every character of model-oriented evidence survives, including every
+        # dated quote, qualification, source version and confidence field.
+        assert rendered["result"] == payload["result"]
+        if "structuredContent" in payload:
+            assert rendered.get("structuredContent", json.loads(rendered["result"])) == payload["structuredContent"]
+        msg = make_tool_result_message(row["tool_name"], adapted, row["tool_call_id"])
+        messages.append(msg)
+        db.append_message(sid, "tool", content, tool_call_id=row["tool_call_id"], tool_name=row["tool_name"])
+
+    expected = [m["content"] for m in messages]
+    assert sum(map(len, expected)) < 200000
+    with patch("agent.tool_executor.get_active_env", return_value=None):
+        execute_tool_calls_segmented(agent, types.SimpleNamespace(tool_calls=calls), messages, "t", segments=[])
+    assert [m["content"] for m in messages] == expected
+    rows = [r for r in db.get_messages(sid) if r["role"] == "tool"]
+    assert [r["content"] for r in rows] == [r["content"] for r in original]
+    assert [r["api_content"] for r in rows] == expected
+    db.append_message(sid, "assistant", "evidence received")
+    agent.run_conversation("continue", conversation_history=db.get_messages_as_conversation(sid))
+    request = _chat_requests(handler)[-1]
+    sent = [m for m in request["messages"] if m["role"] == "tool"]
+    assert [m["content"] for m in sent] == expected
+    assert [m["tool_call_id"] for m in sent] == [r["tool_call_id"] for r in original]
+
+
 @pytest.fixture()
 def wire_env():
     """Mock provider + isolated HERMES_HOME + a shared SessionDB.
@@ -521,6 +611,26 @@ def _user_messages(req: dict) -> list:
 
 
 class TestWireInvariant:
+    def test_per_result_budget_retains_raw_and_records_actual_request(self, wire_env):
+        make_agent, handler, db, sid = wire_env
+        agent = make_agent()
+        raw = "complete evidence\n" * 8000
+        agent.valid_tool_names = {"search_files"}
+        handler.response_queue.extend([_tc_resp("search_files"), _text_resp("done")])
+        with patch.object(agent, "_invoke_tool", return_value=raw), \
+             patch("run_agent.handle_function_call", return_value=raw), \
+             patch("agent.tool_executor.get_active_env", return_value=None):
+            agent.run_conversation("read evidence", conversation_history=[], task_id="t")
+        requests = _chat_requests(handler)
+        assert len(requests) == 2
+        tools = [m for m in requests[1]["messages"] if m["role"] == "tool"]
+        assert len(tools) == 1
+        assert len(tools[0]["content"]) < len(raw)
+        rows = [r for r in db.get_messages(sid) if r["role"] == "tool"]
+        assert len(rows) == 1
+        assert rows[0]["content"] == raw
+        assert rows[0]["api_content"] == tools[0]["content"]
+
     def test_injection_sent_stamped_and_stable_within_turn(self, wire_env):
         """The current turn's user message goes out with the injected context,
         the sidecar equals the sent bytes exactly, the field never reaches the

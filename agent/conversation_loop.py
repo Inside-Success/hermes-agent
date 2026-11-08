@@ -1292,8 +1292,8 @@ def run_conversation(
                         api_msg["content"] = _composed
             elif (
                 isinstance(_api_content, str)
-                and _api_content
-                and msg.get("role") in ("user", "assistant")
+                and (_api_content or msg.get("role") == "tool")
+                and msg.get("role") in ("user", "assistant", "tool")
             ):
                 # Historical message: replay the exact bytes sent when it was
                 # live, so the provider prompt-cache prefix stays byte-stable
