@@ -1173,6 +1173,7 @@ def run_conversation(
         # iteration, no tools yet), the steer stays pending for the next
         # tool batch — injecting into a user message would break role
         # alternation, and there's no tool output to piggyback on.
+        _steered_tool_id = None
         _pre_api_steer = agent._drain_pending_steer()
         if _pre_api_steer:
             _injected = False
@@ -1181,7 +1182,9 @@ def run_conversation(
                 if isinstance(_sm, dict) and _sm.get("role") == "tool":
                     from agent.prompt_builder import format_steer_marker
                     marker = format_steer_marker(_pre_api_steer)
-                    existing = _sm.get("content", "")
+                    existing = _sm.pop("api_content", None)
+                    if existing is None:
+                        existing = _sm.get("content", "")
                     if isinstance(existing, str):
                         _sm["content"] = existing + marker
                     else:
@@ -1193,6 +1196,7 @@ def run_conversation(
                         except Exception:
                             pass
                     _injected = True
+                    _steered_tool_id = _sm.get("tool_call_id")
                     logger.debug(
                         "Pre-API-call steer drain: injected into tool msg at index %d",
                         _si,
@@ -1506,6 +1510,24 @@ def run_conversation(
         # lone surrogates (U+D800-U+DFFF) that crash json.dumps() inside
         # the OpenAI SDK. Sanitizing here prevents the 3-retry cycle.
         _sanitize_messages_surrogates(api_messages)
+
+        # Budgets and progress flushes run before this final normalization.
+        # Capture the current turn's actual text input here, including late
+        # steer, while leaving untouched historical rows explicitly unknown.
+        # A historical tool modified by this iteration's steer is an exception:
+        # its newly sent view must replace its now-stale replay sidecar.
+        from agent.tool_executor import _persist_tool_api_content
+        _current_tool_ids = {
+            m.get("tool_call_id")
+            for m in messages[current_turn_user_idx + 1:]
+            if m.get("role") == "tool"
+        }
+        if _steered_tool_id:
+            _current_tool_ids.add(_steered_tool_id)
+        _persist_tool_api_content(agent, [
+            m for m in api_messages
+            if m.get("role") == "tool" and m.get("tool_call_id") in _current_tool_ids
+        ])
 
         # Apply Anthropic prompt caching for Claude models on native
         # Anthropic, OpenRouter, and third-party Anthropic-compatible

@@ -459,7 +459,8 @@ def _text_resp(text: str) -> dict:
     }
 
 
-def test_reloaded_tool_sidecar_reaches_actual_request(wire_env):
+@pytest.mark.parametrize("late_steer", [False, True])
+def test_reloaded_tool_sidecar_reaches_actual_request(wire_env, late_steer):
     make_agent, handler, db, sid = wire_env
     db.create_session(sid, source="cli")
     db.append_message(sid, "user", "question")
@@ -471,11 +472,19 @@ def test_reloaded_tool_sidecar_reaches_actual_request(wire_env):
                       api_content="actual post-budget result")
     db.append_message(sid, "assistant", "prior answer")
     agent = make_agent()
+    if late_steer:
+        agent.step_callback = lambda count, tools: agent.steer("check the evidence")
     agent.run_conversation("continue", conversation_history=db.get_messages_as_conversation(sid))
     request = next(r for r in handler.captured_requests if "messages" in r)
     tools = [m for m in request["messages"] if m["role"] == "tool"]
     assert len(tools) == 1
-    assert tools[0]["content"] == "actual post-budget result"
+    assert tools[0]["content"].startswith("actual post-budget result")
+    if late_steer:
+        assert "check the evidence" in tools[0]["content"]
+        row = next(r for r in db.get_messages(sid) if r["role"] == "tool")
+        assert row["api_content"] == tools[0]["content"]
+    else:
+        assert tools[0]["content"] == "actual post-budget result"
     assert tools[0]["tool_call_id"] == "call_1"
     assert "api_content" not in tools[0]
 
@@ -611,6 +620,27 @@ def _user_messages(req: dict) -> list:
 
 
 class TestWireInvariant:
+    @pytest.mark.parametrize("late_steer", [False, True])
+    def test_tool_sidecar_matches_final_normalized_request(self, wire_env, late_steer):
+        make_agent, handler, db, sid = wire_env
+        agent = make_agent()
+        agent.valid_tool_names = {"search_files"}
+        raw = "  evidence with whitespace\n"
+        if late_steer:
+            agent.step_callback = lambda count, tools: agent.steer("check qualifiers") if count == 1 else None
+        handler.response_queue.extend([_tc_resp("search_files"), _text_resp("done")])
+        with patch("run_agent.handle_function_call", return_value=raw), \
+             patch.object(agent, "_invoke_tool", return_value=raw):
+            agent.run_conversation("read evidence", conversation_history=[], task_id="t")
+        requests = _chat_requests(handler)
+        sent = next(m for m in requests[1]["messages"] if m["role"] == "tool")["content"]
+        if late_steer:
+            assert "check qualifiers" in sent
+        assert sent == sent.strip()
+        row = next(r for r in db.get_messages(sid) if r["role"] == "tool")
+        assert row["content"] == raw
+        assert row["api_content"] == sent
+
     def test_per_result_budget_retains_raw_and_records_actual_request(self, wire_env):
         make_agent, handler, db, sid = wire_env
         agent = make_agent()
