@@ -100,8 +100,8 @@ def substitute_api_content(api_msg: Dict[str, Any]) -> Optional[str]:
     sidecar = api_msg.pop("api_content", None)
     if (
         isinstance(sidecar, str)
-        and sidecar
-        and api_msg.get("role") in ("user", "assistant")
+        and (sidecar or api_msg.get("role") == "tool")
+        and api_msg.get("role") in ("user", "assistant", "tool")
     ):
         api_msg["content"] = sidecar
     return sidecar
