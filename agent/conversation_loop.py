@@ -1028,6 +1028,9 @@ def run_conversation(
 
     # Main conversation loop counters (pure locals consumed by the loop below).
     api_call_count = 0
+    # Redirect/compression can refund logical API calls and restart the outer
+    # loop. Dispatch identities must remain unique for the entire turn.
+    api_attempt_count = 0
     final_response = None
     interrupted = False
     failed = False
@@ -1830,7 +1833,6 @@ def run_conversation(
         api_kwargs = None  # Guard against UnboundLocalError in except handler
         api_request_id = f"{turn_id}:api:{api_call_count}"
         agent._current_api_request_id = api_request_id
-        api_attempt_count = 0
 
         while retry_count < max_retries:
             # ── Nous Portal rate limit guard ──────────────────────

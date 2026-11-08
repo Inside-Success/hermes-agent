@@ -620,6 +620,40 @@ def _user_messages(req: dict) -> list:
 
 
 class TestWireInvariant:
+    def test_redirect_restart_keeps_dispatch_attempt_ids_unique(self, wire_env):
+        make_agent, handler, db, sid = wire_env
+        agent = make_agent()
+        handler.response_queue.append(_text_resp("done"))
+        original_call = agent._interruptible_streaming_api_call
+        redirected = []
+        attempts = []
+
+        def capture_attempt(event, **payload):
+            if event in {"pre_api_attempt", "post_api_attempt"}:
+                attempts.append((event, dict(payload)))
+            return []
+
+        def redirect_once(kwargs, **options):
+            if not redirected:
+                redirected.append(True)
+                agent.redirect("Use corrected question")
+                raise InterruptedError("request cancelled for redirect")
+            return original_call(kwargs, **options)
+
+        with patch.object(agent, "_interruptible_streaming_api_call", side_effect=redirect_once), \
+             patch("hermes_cli.plugins.has_hook", side_effect=lambda event: event in {"pre_api_attempt", "post_api_attempt"}), \
+             patch("hermes_cli.plugins.invoke_hook", side_effect=capture_attempt):
+            agent.run_conversation("original question", conversation_history=[], task_id="t")
+        before = [p for event, p in attempts if event == "pre_api_attempt"]
+        after = [p for event, p in attempts if event == "post_api_attempt"]
+        assert len(before) == len(after) == 2
+        assert before[0]["api_request_id"] == before[1]["api_request_id"]
+        assert len({p["api_attempt_id"] for p in before}) == 2
+        assert [p["api_attempt_id"] for p in before] == [p["api_attempt_id"] for p in after]
+        assert isinstance(after[0]["error"], InterruptedError)
+        assert after[1]["error"] is None
+        assert after[1]["response"] is not None
+
     def test_retry_sidecar_matches_ascii_fallback_request(self, wire_env):
         from copy import deepcopy
         make_agent, handler, db, sid = wire_env
