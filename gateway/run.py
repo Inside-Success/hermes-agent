@@ -7395,12 +7395,66 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
     # Drain-timeout reasons set by _stop_impl() when a still-running turn is
     # force-interrupted; "restart_interrupted" is set by
-    # SessionStore.suspend_recently_active() on crash recovery (no
-    # .clean_shutdown marker).  All three mean "the agent was mid-turn and
-    # we killed it" — eligible for startup auto-resume.
+    # SessionStore.suspend_recently_active() on crash recovery (neither
+    # .clean_shutdown nor .shutdown_resume_marked).  All three mean "the
+    # agent was mid-turn and we killed it" — eligible for startup auto-resume.
     _AUTO_RESUME_REASONS = frozenset(
         {"restart_timeout", "shutdown_timeout", "restart_interrupted"}
     )
+
+    async def _mark_sessions_interrupted_by_previous_run(self) -> int:
+        """Mark, once at startup, the sessions the previous process left mid-turn.
+
+        Returns how many sessions this call marked resume_pending.
+        """
+        # Suspend sessions that were active when the gateway last exited.
+        # This prevents stuck sessions from being blindly resumed on restart,
+        # which can create an unrecoverable loop (#7536).  Suspended sessions
+        # auto-reset on the next incoming message, giving the user a clean start.
+        #
+        # SKIP suspension after a clean (graceful) shutdown — the previous
+        # process already drained active agents, so sessions aren't stuck.
+        # This prevents unwanted auto-resets after `hermes update`,
+        # `hermes gateway restart`, or `/restart`.
+        _clean_marker = _hermes_home / ".clean_shutdown"
+        _marked_marker = _hermes_home / ".shutdown_resume_marked"
+        if _clean_marker.exists():
+            logger.info("Previous gateway exited cleanly — skipping session suspension")
+            for _marker in (_clean_marker, _marked_marker):
+                try:
+                    _marker.unlink(missing_ok=True)
+                except Exception:
+                    pass
+            return 0
+        # The previous process got far enough into shutdown to mark every
+        # turn it was about to interrupt resume_pending (written before the
+        # drain, #27856), but then timed out the drain or was killed during
+        # it.  Those marks are the exact record of what was cut off.  The
+        # recently-active sweep below would add every session touched in the
+        # last 120 s on top — including conversations that had already
+        # finished — and auto-resume would then re-run each of them with a
+        # stray reply.  Rely on the shutdown marks instead.
+        if _marked_marker.exists():
+            logger.info(
+                "Previous gateway marked its interrupted session(s) at shutdown "
+                "— skipping the recently-active sweep"
+            )
+            try:
+                _marked_marker.unlink(missing_ok=True)
+            except Exception:
+                pass
+            return 0
+        # No shutdown record at all (crash, OOM, SIGKILL): nothing says which
+        # turns were running, so keep the recently-active sweep as the
+        # crash-recovery safety net.
+        try:
+            suspended = await self.async_session_store.suspend_recently_active()
+            if suspended:
+                logger.info("Marked %d in-flight session(s) as resumable from previous run", suspended)
+            return suspended
+        except Exception as e:
+            logger.warning("Session suspension on startup failed: %s", e)
+            return 0
 
     async def _run_startup_resume_event(
         self,
@@ -8115,29 +8169,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         except Exception as e:
             logger.warning("Process checkpoint recovery: %s", e)
 
-        # Suspend sessions that were active when the gateway last exited.
-        # This prevents stuck sessions from being blindly resumed on restart,
-        # which can create an unrecoverable loop (#7536).  Suspended sessions
-        # auto-reset on the next incoming message, giving the user a clean start.
-        #
-        # SKIP suspension after a clean (graceful) shutdown — the previous
-        # process already drained active agents, so sessions aren't stuck.
-        # This prevents unwanted auto-resets after `hermes update`,
-        # `hermes gateway restart`, or `/restart`.
-        _clean_marker = _hermes_home / ".clean_shutdown"
-        if _clean_marker.exists():
-            logger.info("Previous gateway exited cleanly — skipping session suspension")
-            try:
-                _clean_marker.unlink()
-            except Exception:
-                pass
-        else:
-            try:
-                suspended = await self.async_session_store.suspend_recently_active()
-                if suspended:
-                    logger.info("Marked %d in-flight session(s) as resumable from previous run", suspended)
-            except Exception as e:
-                logger.warning("Session suspension on startup failed: %s", e)
+        await self._mark_sessions_interrupted_by_previous_run()
 
         # Stuck-loop detection (#7536): if a session has been active across
         # 3+ consecutive restarts, it's probably stuck in a loop (the same
@@ -9604,6 +9636,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # drain, the durable marker is already written so the next
             # gateway boot can recover in-flight sessions (#27856).
             _pre_drain_keys: list[str] = []
+            _pre_drain_mark_failed = False
             for _sk, _agent in list(self._running_agents.items()):
                 if _agent is _AGENT_PENDING_SENTINEL:
                     continue
@@ -9614,7 +9647,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     )
                     _pre_drain_keys.append(_sk)
                 except Exception as _e:
+                    _pre_drain_mark_failed = True
                     logger.debug("pre-drain mark_resume_pending failed for %s: %s", _sk, _e)
+            # Record that every in-flight turn is now marked.  New work is
+            # refused once _draining is set, so these marks stay complete.  If
+            # the drain times out or the process is killed during it, the next
+            # startup relies on these marks instead of sweeping every recently
+            # active session (which re-runs conversations that had already
+            # finished).  If any mark failed, leave no record so the next
+            # startup falls back to that sweep.
+            if not _pre_drain_mark_failed:
+                try:
+                    (_hermes_home / ".shutdown_resume_marked").touch()
+                except Exception:
+                    pass
 
             _cron_at_start = self._active_cron_job_count()
             _api_at_start = self._active_api_run_count()
@@ -9845,9 +9891,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # after unexpected exits.  However, if the drain timed out and
             # agents were force-interrupted, their sessions may be in an
             # incomplete state (trailing tool response, no final assistant
-            # message).  Skip the marker in that case so the next startup
-            # suspends those sessions — giving users a clean slate instead
-            # of resuming a half-finished tool loop.
+            # message).  Skip the marker in that case.  Those sessions are
+            # already marked resume_pending (above), and the
+            # .shutdown_resume_marked record written before the drain tells
+            # the next startup to rely on those marks rather than sweep every
+            # recently active session.
             if not timed_out:
                 try:
                     (_hermes_home / ".clean_shutdown").touch()
@@ -9856,8 +9904,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             else:
                 logger.info(
                     "Skipping .clean_shutdown marker — drain timed out with "
-                    "interrupted agents; next startup will suspend recently "
-                    "active sessions."
+                    "interrupted agents; next startup will resume the "
+                    "sessions marked at shutdown."
                 )
 
             # Track sessions that were active at shutdown for stuck-loop
@@ -12394,7 +12442,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             group_sessions_per_user=_group_sessions_per_user,
             thread_sessions_per_user=_thread_sessions_per_user,
         )
-        if _is_shared_multi_user and source.user_name:
+        # A blank internal event (the startup auto-resume turn) carries no
+        # user text; its source is only the routing target copied from the
+        # session origin.  Labelling it with that speaker turns it into what
+        # looks like a real, empty user message, so the restart recovery note
+        # tells the model to answer a NEW message and the blank-turn guard in
+        # _handle_message_with_agent never fires.
+        _is_blank_internal_turn = bool(
+            getattr(event, "internal", False) and not message_text.strip()
+        )
+        if _is_shared_multi_user and source.user_name and not _is_blank_internal_turn:
             # source.user_name is the platform display name — attacker-
             # influenceable on any platform that lets participants set their
             # own name. Neutralize embedded newlines/control chars before
