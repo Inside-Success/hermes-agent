@@ -116,6 +116,7 @@ class TestOpenRouterProfile:
         a = p.build_extra_body(session_id="20261111_120000_aaaaaa")
         b = p.build_extra_body(session_id="20261111_120030_bbbbbb")
         assert a["session_id"] == b["session_id"] == "hermes-reality-brain"
+        assert "session_id" not in p.build_extra_body()
 
     def test_extra_body_session_id_default_mode_keeps_session(self, tmp_path, monkeypatch):
         home = tmp_path / ".hermes"

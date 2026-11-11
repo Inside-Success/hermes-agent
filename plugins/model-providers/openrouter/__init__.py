@@ -45,12 +45,15 @@ def _openrouter_session_id(session_id: str | None) -> str | None:
     ``profile`` sends one stable id per profile (``hermes-<profile>``) so
     sessions of the same profile share the cached system prompt.
     """
+    if not session_id:
+        # Calls without a session (auxiliary tasks) keep upstream behaviour.
+        return session_id
     mode = "session"
     try:
-        from hermes_cli.config import load_config
+        from hermes_cli.config import load_config_readonly
 
         mode = str(
-            (load_config().get("openrouter") or {}).get("prompt_cache_session")
+            (load_config_readonly().get("openrouter") or {}).get("prompt_cache_session")
             or "session"
         ).strip().lower()
     except Exception as exc:  # config unreadable: keep upstream behaviour
