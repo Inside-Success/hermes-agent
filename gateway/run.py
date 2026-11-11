@@ -117,6 +117,12 @@ _TELEGRAM_NOISY_STATUS_RE = re.compile(
     r"|max\s+retries\s+\(\d+\).*(?:trying\s+fallback|exhausted|invalid\s+responses)"
     r"|stream\s+(?:drop|drop\s+mid\s+tool-call).+retry\s+\d"
     r"|stale\s+connections\s+from\s+a\s+previous\s+provider\s+issue"
+    # Empty-content retry chatter from agent/conversation_loop.py. Each
+    # retry is a separate chat message on Slack (four lines in one thread,
+    # 2026-11-11); the turn's own final reply or failure notice is enough.
+    r"|empty\s+response\s+from\s+model\s+[—-]+\s+retrying"
+    r"|model\s+returned\s+empty\s+after\s+tool\s+calls"
+    r"|model\s+returned\s+no\s+content\s+after\s+all\s+retries"
     r")",
     re.IGNORECASE | re.DOTALL,
 )
