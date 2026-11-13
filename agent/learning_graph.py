@@ -196,27 +196,13 @@ def _memory_cards() -> list[dict[str, Any]]:
     ``MEMORY.md`` / ``USER.md`` are prose split on bare ``§`` separators; each
     chunk becomes one card. Every chunk is surfaced — the graph shows everything.
     """
-    base = get_hermes_home() / "memories"
-    cards: list[dict[str, Any]] = []
-    for fname, source in (("MEMORY.md", "memory"), ("USER.md", "profile")):
-        path = base / fname
-        try:
-            text = path.read_text(encoding="utf-8").strip()
-            file_ts = _to_int_ts(path.stat().st_mtime)
-        except OSError:
-            continue
-        for chunk_idx, chunk in enumerate(c.strip() for c in text.split("\n§\n")):
-            if not chunk:
-                continue
-            first = chunk.splitlines()[0].strip().lstrip("# ").strip()
-            cards.append(
-                {
-                    "source": source,
-                    "timestamp": file_ts + chunk_idx if file_ts is not None else None,
-                    "title": (first[:80] + "…") if len(first) > 80 else first,
-                    "body": chunk[:1200],
-                }
-            )
+    from tools.memory_tool import MemoryStore
+    store = MemoryStore()
+    cards = []
+    for target, source in (("memory", "memory"), ("user", "profile")):
+        for item in store.native_items(target):
+            first = item['body'].splitlines()[0].strip().lstrip('# ').strip()
+            cards.append(dict(item, source=source, title=first[:80], body=item['body'][:1200]))
     return cards
 
 
@@ -228,7 +214,7 @@ def _memory_skill_edges(memory_cards: list[dict[str, Any]], skills: list[SkillNo
     edges: list[tuple[str, str]] = []
     skill_meta = [(s, _tokenize(s.name), s.name.lower()) for s in skills]
     for idx, card in enumerate(memory_cards):
-        mem_id = f"memory:{card['source']}:{idx}"
+        mem_id = card["id"]
         text = f"{card.get('title', '')}\n{card.get('body', '')}".lower()
         text_tokens = _tokenize(text)
         scored: list[tuple[int, str]] = []
@@ -293,7 +279,11 @@ def build_learning_graph() -> dict[str, Any]:
     for i, card in enumerate(memory_cards):
         graph_nodes.append(
             {
-                "id": f"memory:{card['source']}:{i}",
+                "id": card["id"],
+                "item_id": card["item_id"],
+                "revision": card["revision"],
+                "observed_at": card["observed_at"],
+                "provenance": card["provenance"],
                 "label": card["title"],
                 "kind": "memory",
                 "memorySource": card["source"],

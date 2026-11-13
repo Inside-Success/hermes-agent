@@ -1153,6 +1153,27 @@ CREATE TABLE IF NOT EXISTS state_meta (
     value TEXT
 );
 
+-- Native memory metadata belongs to the same profile database as sessions.
+CREATE TABLE IF NOT EXISTS memory_documents (
+    target TEXT PRIMARY KEY,
+    content_hash TEXT NOT NULL,
+    items_json TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS memory_write_journal (
+    id TEXT PRIMARY KEY,
+    target TEXT NOT NULL,
+    status TEXT NOT NULL,
+    before_hash TEXT NOT NULL,
+    after_hash TEXT NOT NULL,
+    before_items_json TEXT NOT NULL,
+    after_items_json TEXT NOT NULL,
+    metadata_json TEXT,
+    prepared_at REAL NOT NULL,
+    committed_at REAL
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_memory_pending ON memory_write_journal(target)
+    WHERE status IN ('prepared', 'materialized');
+
 CREATE TABLE IF NOT EXISTS gateway_routing (
     scope TEXT NOT NULL DEFAULT '',
     session_key TEXT NOT NULL,
@@ -5217,6 +5238,83 @@ class SessionDB:
             return result.rowcount
 
         return self._execute_write(_do) or 0
+
+    def memory_require_durable(self):
+        """This connection commits the native file journal before acknowledging a write."""
+        with self._lock:
+            self._conn.execute('PRAGMA synchronous=FULL')
+
+    # Implements: native-memory/honest-native-provenance
+    def memory_document(self, target: str):
+        """Native memory snapshot; caller holds the target's MemoryStore lock."""
+        with self._lock:
+            row = self._conn.execute("SELECT * FROM memory_documents WHERE target = ?", (target,)).fetchone()
+        return dict(row) if row else None
+
+    def memory_observe(self, target: str, content_hash: str, items: list):
+        """Record observation only, never infer historical creation metadata."""
+        self._execute_write(lambda conn: conn.execute(
+            "INSERT OR REPLACE INTO memory_documents VALUES (?, ?, ?)",
+            (target, content_hash, json.dumps(items))))
+
+    def memory_pending(self, target: str):
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM memory_write_journal WHERE target=? AND status IN ('prepared','materialized')",
+                (target,)).fetchone()
+        return dict(row) if row else None
+
+    def memory_prepare(self, record: dict):
+        """Durably prepare before any file materialization. Failure must propagate."""
+        self._execute_write(lambda conn: conn.execute(
+            "INSERT INTO memory_write_journal VALUES (?, ?, 'prepared', ?, ?, ?, ?, ?, ?, NULL)",
+            (record['id'], record['target'], record['before_hash'], record['after_hash'],
+             json.dumps(record['before']), json.dumps(record['after']),
+             json.dumps(record['metadata']), time.time())))
+
+    def memory_materialized(self, revision: str):
+        self._execute_write(lambda conn: conn.execute(
+            "UPDATE memory_write_journal SET status='materialized' WHERE id=? AND status='prepared'", (revision,)))
+
+    def memory_finish(self, record: dict, *, committed: bool):
+        """Atomically commit provenance and current snapshot, or abort an unwritten prepare."""
+        def finish(conn):
+            now = time.time()
+            if committed:
+                items = json.loads(record['after_items_json'])
+                for item in items:
+                    if item['revision'] == record['id']:
+                        item['timestamp'] = now
+                conn.execute("INSERT OR REPLACE INTO memory_documents VALUES (?, ?, ?)",
+                             (record['target'], record['after_hash'], json.dumps(items)))
+                conn.execute("UPDATE memory_write_journal SET status='committed', committed_at=? WHERE id=?",
+                             (now, record['id']))
+            else:
+                conn.execute("UPDATE memory_write_journal SET status='aborted' WHERE id=?", (record['id'],))
+        self._execute_write(finish)
+
+    def memory_history(self, target: str, item_id: str):
+        """Committed before/after images permit compensating edits without whole-file rollback."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT * FROM memory_write_journal WHERE target=? AND status='committed' ORDER BY prepared_at, rowid",
+                (target,)).fetchall()
+        revisions = {}
+        for row in rows:
+            before = json.loads(row['before_items_json'])
+            after = json.loads(row['after_items_json'])
+            for item in after:
+                if item['revision'] == row['id']:
+                    item['timestamp'] = row['committed_at']
+            for item in before + after:
+                if item['item_id'] == item_id:
+                    revisions[item['revision']] = item
+            if any(item['item_id'] == item_id for item in before) and not any(
+                    item['item_id'] == item_id for item in after):
+                revisions[row['id']] = {'item_id': item_id, 'revision': row['id'],
+                                        'body': None, 'timestamp': row['committed_at'],
+                                        'deleted': True}
+        return list(revisions.values())
 
     def get_session(self, session_id: str) -> Optional[Dict[str, Any]]:
         """Get a session by ID."""

@@ -268,6 +268,8 @@ def _cmd_delete(args: argparse.Namespace) -> int:
             return 1
     res = delete_node(args.node)
     print(f"  {res['message']}")
+    if res.get("id"):
+        print(res["id"])
     return 0 if res.get("ok") else 1
 
 
@@ -285,7 +287,27 @@ def _cmd_edit(args: argparse.Namespace) -> int:
         return 0
     res = edit_node(args.node, edited)
     print(f"  {res['message']}")
+    if res.get("id"):
+        print(res["id"])
     return 0 if res.get("ok") else 1
+
+
+def _cmd_history(args: argparse.Namespace) -> int:
+    import json
+    from agent.learning_mutations import node_detail
+    result = node_detail(args.node)
+    print(json.dumps(result, ensure_ascii=False))
+    return 0 if result.get('ok') else 1
+
+
+# Implements: native-memory/compensating-journey-revert
+def _cmd_revert(args: argparse.Namespace) -> int:
+    from agent.learning_mutations import revert_node
+    result = revert_node(args.node, args.revision)
+    print(result['message'])
+    if result.get('ok'):
+        print(result['id'])
+    return 0 if result.get('ok') else 1
 
 
 def _open_in_editor(initial: str, *, suffix: str) -> Optional[str]:
@@ -337,17 +359,26 @@ def register_cli(parent: argparse.ArgumentParser) -> None:
     p_list.set_defaults(func=_cmd_list)
 
     p_del = sub.add_parser("delete", help="Delete a learned skill (archived) or memory by node id.")
-    p_del.add_argument("node", help="Node id (skill name or memory:<source>:<index>; see `journey list`).")
+    p_del.add_argument("node", help="Node id (skill name or memory:<source>:<item>:<revision>; see `journey list`).")
     p_del.add_argument("-y", "--yes", action="store_true", help="Skip the confirmation prompt.")
     p_del.set_defaults(func=_cmd_delete)
 
     p_edit = sub.add_parser("edit", help="Edit a learned skill or memory by node id in $EDITOR.")
-    p_edit.add_argument("node", help="Node id (skill name or memory:<source>:<index>; see `journey list`).")
+    p_edit.add_argument("node", help="Node id (skill name or memory:<source>:<item>:<revision>; see `journey list`).")
     p_edit.set_defaults(func=_cmd_edit)
+
+    p_history = sub.add_parser("history", help="Inspect native memory content, provenance and revision history as JSON.")
+    p_history.add_argument("node", help="Revision-bound memory id from journey list.")
+    p_history.set_defaults(func=_cmd_history)
+
+    p_revert = sub.add_parser("revert", help="Restore one memory revision as a new compensating edit.")
+    p_revert.add_argument("node", help="Current memory id, or deletion receipt id.")
+    p_revert.add_argument("revision", help="Prior revision from journey history.")
+    p_revert.set_defaults(func=_cmd_revert)
 
 
 def cmd_journey(args: argparse.Namespace) -> int:
-    return _cmd_show(args)
+    return getattr(args, "func", _cmd_show)(args)
 
 
 if __name__ == "__main__":

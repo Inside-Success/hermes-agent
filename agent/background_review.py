@@ -613,7 +613,7 @@ def build_memory_write_metadata(
     task_id: Optional[str] = None,
     tool_call_id: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """Build provenance metadata for external memory-provider mirrors."""
+    """Build host-only causal metadata for native writes and provider mirrors."""
     metadata: Dict[str, Any] = {
         "write_origin": write_origin or getattr(agent, "_memory_write_origin", "assistant_tool"),
         "execution_context": (

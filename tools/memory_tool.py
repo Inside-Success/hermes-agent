@@ -24,6 +24,8 @@ Design:
 """
 
 import json
+import hashlib
+import uuid
 import logging
 import os
 import tempfile
@@ -34,6 +36,7 @@ from hermes_constants import get_hermes_home
 from typing import Dict, Any, List, Optional, Tuple
 
 from utils import atomic_replace
+from tools.skill_provenance import native_memory_write_metadata as _write_metadata
 
 # fcntl is Unix-only; on Windows use msvcrt for file locking
 msvcrt = None
@@ -147,6 +150,8 @@ def _read_failed_error(path: "Path") -> Dict[str, Any]:
     }
 
 
+# Implements: native-memory/stable-revision-bound-native-memory-handles
+# Implements: native-memory/recoverable-file-and-provenance-commit
 class MemoryStore:
     """
     Bounded curated memory with file persistence. One instance per AIAgent.
@@ -174,6 +179,10 @@ class MemoryStore:
         # Per-turn counter of failed at-capacity consolidation attempts; reset
         # at each turn boundary by reset_consolidation_failures() (#42405).
         self._consolidation_failures = 0
+        self._profile_home = get_hermes_home().resolve()
+        self._native_order = {}
+        self._native_before = {}
+        self._native_raw = {}
 
     def reset_consolidation_failures(self) -> None:
         """Reset the per-turn consolidation-failure counter (call at turn start)."""
@@ -358,14 +367,183 @@ class MemoryStore:
         # external writer had just added. One read, one snapshot, no window.
         bak = None if skip_drift else self._detect_external_drift(target, raw)
         fresh = self._parse_entries(raw)
-        fresh = list(dict.fromkeys(fresh))  # deduplicate
         self._set_entries(target, fresh)
+        self._native_before[target] = self._native_snapshot(target, raw)
+        self._native_order[target] = list(self._native_before[target])
+        self._native_raw[target] = raw
         return bak
 
-    def save_to_disk(self, target: str):
+    def save_to_disk(self, target: str, *, force_item_id=None):
         """Persist entries to the appropriate file. Called after every mutation."""
-        get_memory_dir().mkdir(parents=True, exist_ok=True)
-        self._write_file(self._path_for(target), self._entries_for(target))
+        if self._profile_home != get_hermes_home().resolve():
+            raise RuntimeError("Memory store belongs to a different profile")
+        path = self._path_for(target)
+        raw, ok = self._read_raw_checked(path)
+        if not ok or raw != self._native_raw[target]:
+            raise RuntimeError("Native memory changed before materialization")
+        entries = self._entries_for(target)
+        revision = uuid.uuid4().hex
+        with self._native_db() as db:
+            metadata = self._trusted_metadata(db)
+            after = []
+            for entry, prior in zip(entries, self._native_order[target]):
+                if prior is not None and prior['body'] == entry and prior['item_id'] != force_item_id:
+                    after.append(dict(prior))
+                else:
+                    after.append({
+                        'item_id': prior['item_id'] if prior else uuid.uuid4().hex,
+                        'revision': revision, 'body': entry, 'timestamp': None,
+                        'observed_at': time.time(), 'provenance': metadata,
+                    })
+            if len(after) != len(entries):
+                raise RuntimeError("Native memory identity mismatch")
+            record = {'id': revision, 'target': target, 'before_hash': self._hash(raw),
+                      'after_hash': self._hash(ENTRY_DELIMITER.join(entries)),
+                      'before': self._native_before[target], 'after': after, 'metadata': metadata}
+            db.memory_prepare(record)
+            # No success is returned until both file and provenance commit land.
+            self._write_file(path, entries)
+            db.memory_materialized(revision)
+            pending = db.memory_pending(target)
+            current, ok = self._read_raw_checked(path)
+            if not ok or self._hash(current) != record['after_hash']:
+                raise RuntimeError("Native memory materialization conflict")
+            db.memory_finish(pending, committed=True)
+        return revision
+
+    @staticmethod
+    def _hash(raw):
+        return hashlib.sha256(raw.encode('utf-8')).hexdigest()
+
+    @contextmanager
+    def _native_db(self):
+        from hermes_state import SessionDB
+        if self._profile_home != get_hermes_home().resolve():
+            raise RuntimeError("Memory store belongs to a different profile")
+        db = SessionDB(self._profile_home / 'state.db')
+        try:
+            db.memory_require_durable()
+            yield db
+        finally:
+            db.close()
+
+    @staticmethod
+    def _trusted_metadata(db):
+        context = _write_metadata.get() or {}
+        sid = context.get('session_id')
+        session = db.get_session(sid) if sid else None
+        if sid and session is None:
+            raise RuntimeError("Causal memory session is not in the active profile")
+        if not session:
+            return None
+        metadata = {k: session.get(k) for k in (
+            'source', 'chat_id', 'thread_id', 'parent_session_id', 'profile_name')}
+        metadata['session_id'] = session['id']
+        for key in ('write_origin', 'execution_context', 'task_id', 'tool_call_id', 'tool_name'):
+            if context.get(key):
+                metadata[key] = context[key]
+        return metadata
+
+    def _native_snapshot(self, target, raw):
+        """Recover exact before/after images, then observe external edits conservatively.
+
+        Called only under the existing native file lock. Ambiguous duplicate
+        matches receive fresh identities; a stale handle must never select a sibling.
+        """
+        digest = self._hash(raw)
+        with self._native_db() as db:
+            pending = db.memory_pending(target)
+            if pending:
+                if digest == pending['after_hash']:
+                    db.memory_finish(pending, committed=True)
+                elif digest == pending['before_hash']:
+                    db.memory_finish(pending, committed=False)
+                else:
+                    raise RuntimeError("Native memory journal recovery conflict; file unchanged")
+            document = db.memory_document(target)
+            old = json.loads(document['items_json']) if document else []
+            if document and document['content_hash'] == digest:
+                return old
+            entries = self._parse_entries(raw)
+            observed = time.time()
+            items = []
+            for entry in entries:
+                matches = [item for item in old if item['body'] == entry]
+                if len(matches) == 1 and entries.count(entry) == 1:
+                    items.append(matches[0])
+                else:
+                    items.append({'item_id': uuid.uuid4().hex, 'revision': uuid.uuid4().hex,
+                                  'body': entry, 'timestamp': None, 'observed_at': observed,
+                                  'provenance': None})
+            db.memory_observe(target, digest, items)
+            return items
+
+    def _node_id(self, source, item_id, revision):
+        scope = self._hash(str(self._profile_home))[:16]
+        return f"memory:{source}:{scope}.{item_id}:{revision}"
+
+    def _parse_node_id(self, node_id):
+        parts = node_id.split(':')
+        scope = self._hash(str(self._profile_home))[:16]
+        if (len(parts) != 4 or parts[1] not in {'memory', 'profile'}
+                or not parts[2].startswith(scope + '.')):
+            raise ValueError("Stale or foreign-profile memory id; refresh the journey")
+        parts[2] = parts[2][len(scope) + 1:]
+        return parts
+
+    def native_items(self, target):
+        """Live metadata cards, independent of the frozen prompt snapshot."""
+        with self._file_lock(self._path_for(target)):
+            raw, ok = self._read_raw_checked(self._path_for(target))
+            if not ok:
+                raise RuntimeError("Native memory file unreadable")
+            items = self._native_snapshot(target, raw)
+            source = 'profile' if target == 'user' else 'memory'
+            return [dict(item, id=self._node_id(source, item['item_id'], item['revision'])) for item in items]
+
+    def mutate_item(self, node_id, *, content=None, revert_revision=None):
+        """Revision-bound journey edit/delete/revert through native scan/limits/lock."""
+        parts = self._parse_node_id(node_id)
+        target = 'user' if parts[1] == 'profile' else 'memory'
+        with self._file_lock(self._path_for(target)):
+            bak = self._reload_target(target)
+            if bak is _READ_FAILED or bak:
+                raise ValueError("Memory file unreadable or has external drift")
+            matches = [i for i, item in enumerate(self._native_before[target])
+                       if item['item_id'] == parts[2] and item['revision'] == parts[3]]
+            entries = list(self._entries_for(target))
+            if revert_revision is not None:
+                with self._native_db() as db:
+                    history = db.memory_history(target, parts[2])
+                previous = [item for item in history if item['revision'] == revert_revision]
+                if len(previous) != 1 or previous[0]['body'] is None:
+                    raise ValueError("Memory revision not found for this item")
+                content = previous[0]['body']
+                # A deletion can be compensated only by its exact latest revision.
+                if not matches and history and history[-1].get('deleted') and history[-1]['revision'] == parts[3]:
+                    matches = [len(entries)]
+                    entries.append('')
+                    self._native_order[target].append(dict(previous[0], body=''))
+            if len(matches) != 1:
+                raise ValueError("Stale memory revision; refresh the journey")
+            idx = matches[0]
+            if content is None:
+                entries.pop(idx)
+                self._native_order[target].pop(idx)
+            else:
+                content = content.strip()
+                if not content:
+                    raise ValueError("Empty memory; use delete to remove it")
+                error = _scan_memory_content(content)
+                if error:
+                    raise ValueError(error)
+                entries[idx] = content
+                if len(ENTRY_DELIMITER.join(entries)) > self._char_limit(target):
+                    raise ValueError("Memory character limit exceeded")
+            self._set_entries(target, entries)
+            revision = self.save_to_disk(target, force_item_id=parts[2])
+        return {'ok': True, 'message': 'Memory change committed',
+                'id': self._node_id(parts[1], parts[2], revision)}
 
     def _entries_for(self, target: str) -> List[str]:
         if target == "user":
@@ -443,6 +621,7 @@ class MemoryStore:
                 })
 
             entries.append(content)
+            self._native_order[target].append(None)
             self._set_entries(target, entries)
             self.save_to_disk(target)
 
@@ -556,6 +735,7 @@ class MemoryStore:
 
             idx = matches[0][0]
             entries.pop(idx)
+            self._native_order[target].pop(idx)
             self._set_entries(target, entries)
             self.save_to_disk(target)
 
@@ -611,6 +791,7 @@ class MemoryStore:
                     if content in working:
                         continue  # idempotent -- skip duplicate, don't fail the batch
                     working.append(content)
+                    self._native_order[target].append(None)
 
                 elif act == "replace":
                     if not old_text:
@@ -642,6 +823,7 @@ class MemoryStore:
                             f"{pos}: '{old_text}' matched multiple distinct entries -- be more specific.",
                         )
                     working.pop(matches[0])
+                    self._native_order[target].pop(matches[0])
 
                 else:
                     return self._batch_error(
@@ -768,7 +950,7 @@ class MemoryStore:
         if not path.exists():
             return "", True
         try:
-            return path.read_text(encoding="utf-8"), True
+            return path.read_bytes().decode("utf-8"), True
         except (OSError, IOError, UnicodeDecodeError):
             return "", False
 
@@ -882,7 +1064,14 @@ class MemoryStore:
                     f.write(content)
                     f.flush()
                     os.fsync(f.fileno())
-                atomic_replace(tmp_path, path)
+                resolved = atomic_replace(tmp_path, path)
+                # Persist the rename before the SessionDB provenance commit.
+                if hasattr(os, 'O_DIRECTORY'):
+                    directory_fd = os.open(str(Path(resolved).parent), os.O_RDONLY | os.O_DIRECTORY)
+                    try:
+                        os.fsync(directory_fd)
+                    finally:
+                        os.close(directory_fd)
             except BaseException:
                 # Clean up temp file on any failure
                 try:
@@ -971,6 +1160,8 @@ def _apply_write_gate(action: str, target: str, content: Optional[str],
         "content": content,
         "old_text": old_text,
     }
+    payload['_native_write_metadata'] = _write_metadata.get()
+    payload['_native_profile_scope'] = MemoryStore._hash(str(get_hermes_home().resolve()))
     record = wa.stage_write(
         wa.MEMORY, payload,
         summary=f"{summary}: {detail[:120]}",
@@ -1018,6 +1209,8 @@ def _apply_batch_write_gate(target: str, operations: List[Dict[str, Any]]) -> Op
         return tool_error(decision.message, success=False)
 
     payload = {"action": "batch", "target": target, "operations": operations}
+    payload['_native_write_metadata'] = _write_metadata.get()
+    payload['_native_profile_scope'] = MemoryStore._hash(str(get_hermes_home().resolve()))
     record = wa.stage_write(
         wa.MEMORY, payload,
         summary=f"{summary}: {detail[:120]}",
@@ -1062,7 +1255,7 @@ def _missing_old_text_error(store: "MemoryStore", target: str, action: str) -> s
     )
 
 
-def memory_tool(
+def _memory_tool_impl(
     action: str = None,
     target: str = "memory",
     content: str = None,
@@ -1140,12 +1333,21 @@ def memory_tool(
     return json.dumps(result, ensure_ascii=False)
 
 
+def memory_tool(action=None, target="memory", content=None, old_text=None,
+                operations=None, store=None, *, write_metadata=None):
+    token = _write_metadata.set(write_metadata)
+    try:
+        return _memory_tool_impl(action, target, content, old_text, operations, store)
+    finally:
+        _write_metadata.reset(token)
+
+
 def check_memory_requirements() -> bool:
     """Memory tool has no external requirements -- always available."""
     return True
 
 
-def apply_memory_pending(payload: Dict[str, Any], store: "MemoryStore") -> Dict[str, Any]:
+def _apply_memory_pending_impl(payload: Dict[str, Any], store: "MemoryStore") -> Dict[str, Any]:
     """Replay a staged memory write directly against the store, bypassing the
     write gate. Called by the /memory approve handler.
 
@@ -1164,6 +1366,18 @@ def apply_memory_pending(payload: Dict[str, Any], store: "MemoryStore") -> Dict[
     if action == "remove":
         return store.remove(target, old_text)
     return {"success": False, "error": f"Unknown staged action '{action}'."}
+def apply_memory_pending(payload: Dict[str, Any], store: "MemoryStore") -> Dict[str, Any]:
+    """Keep the existing approval owner; restore only host-supplied staged context."""
+    expected_scope = payload.get('_native_profile_scope')
+    if expected_scope and expected_scope != MemoryStore._hash(str(get_hermes_home().resolve())):
+        return {'success': False, 'error': 'Pending memory belongs to a different profile'}
+    token = _write_metadata.set(payload.get('_native_write_metadata'))
+    try:
+        return _apply_memory_pending_impl(payload, store)
+    finally:
+        _write_metadata.reset(token)
+
+
 # OpenAI Function-Calling Schema
 # =============================================================================
 

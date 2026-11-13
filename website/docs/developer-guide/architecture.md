@@ -203,6 +203,15 @@ Prompt construction and maintenance across the conversation lifecycle:
 
 → [Prompt Assembly](./prompt-assembly.md), [Context Compression & Prompt Caching](./context-compression-and-caching.md)
 
+### Native Memory Revision Journal
+
+`MemoryStore` retains Markdown and frozen prompt snapshots while journaling native
+writes in the profile's existing `SessionDB`. Journey handles contain stable item
+and expected revision identities; native edits/deletes/reverts compare them under
+the same file lock. Historical creation provenance remains unknown. See
+[native memory revisions](../../../docs/native-memory-revisions.md) and the
+[bounded behavior contract](../../../openspec/specs/native-memory/spec.md).
+
 ### Provider Resolution
 
 A shared runtime resolver used by CLI, gateway, cron, ACP, and auxiliary calls. Maps `(provider, model)` tuples to `(api_mode, api_key, base_url)`. Handles 18+ providers, OAuth flows, credential pools, and alias resolution.

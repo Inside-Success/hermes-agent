@@ -329,6 +329,7 @@ gateway = ["assets/**/*"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 markers = [
+    "req(identifier, existing=False): requirement or scenario covered by a behavior contract",
     "integration: marks tests requiring external services (API keys, Modal, etc.)",
     "real_concurrent_gate: opt out of the autouse stub that disables _detect_concurrent_hermes_instances",
     "real_agent_prewarm: opt out of the autouse stub that disables the tui_gateway deferred agent pre-warm timer",
