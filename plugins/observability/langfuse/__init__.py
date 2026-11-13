@@ -28,6 +28,7 @@ import logging
 import math
 import os
 import re
+import stat
 import threading
 import time
 from dataclasses import dataclass, field
@@ -127,6 +128,62 @@ def _require_capture_context(fn):
     return guarded
 
 
+def _policy_allows_full_content() -> bool:
+    """Read the process-owned policy without following its final symlink.
+
+    Entries bind a canonical profile home to its device and inode. Copying a
+    profile to a different directory does not copy permission to capture.
+    This file is an operator-controlled policy, not a security boundary
+    against another writer running as the same operating-system user.
+    """
+    from hermes_constants import get_hermes_home, get_process_hermes_home
+
+    raw_home = get_hermes_home()
+    home = raw_home.resolve(strict=True)
+    if raw_home != home:
+        return False
+    home_stat = home.stat()
+    if not stat.S_ISDIR(home_stat.st_mode):
+        return False
+    process_home = get_process_hermes_home()
+    if not process_home.is_absolute() or not hasattr(os, "O_NOFOLLOW"):
+        return False
+    directory = os.open(process_home, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        directory_info = os.fstat(directory)
+        if (directory_info.st_uid not in (0, os.geteuid())
+                or stat.S_IMODE(directory_info.st_mode) & 0o022):
+            return False
+        fd = os.open("langfuse-full-content-policy.json",
+                     os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory)
+        try:
+            info = os.fstat(fd)
+            if (not stat.S_ISREG(info.st_mode) or info.st_nlink != 1
+                    or info.st_uid not in (0, os.geteuid())
+                    or stat.S_IMODE(info.st_mode) & 0o077 or info.st_size > 65536):
+                return False
+            with os.fdopen(fd, encoding="utf-8") as stream:
+                fd = -1
+                policy_data = json.load(stream)
+        finally:
+            if fd != -1:
+                os.close(fd)
+    finally:
+        os.close(directory)
+    if not isinstance(policy_data, dict) or set(policy_data) != {"version", "profiles"}:
+        return False
+    profiles = policy_data["profiles"]
+    if type(policy_data["version"]) is not int or policy_data["version"] != 1 or not isinstance(profiles, list):
+        return False
+    expected = {"home": str(home), "device": home_stat.st_dev, "inode": home_stat.st_ino}
+    if not all(isinstance(item, dict) and set(item) == set(expected)
+               and isinstance(item["home"], str)
+               and type(item["device"]) is int and type(item["inode"]) is int
+               for item in profiles):
+        return False
+    return expected in profiles
+
+
 def _full_content_enabled() -> bool:
     """Only a currently readable, explicit profile opt-in enables capture."""
     if not _capture_context_available():
@@ -136,8 +193,20 @@ def _full_content_enabled() -> bool:
         from hermes_cli.config import get_config_path
         with get_config_path().open(encoding="utf-8") as stream:
             config = yaml.safe_load(stream)
-        entries = ((config or {}).get("plugins") or {}).get("entries") or {}
-        return (entries.get("observability/langfuse") or {}).get("full_content", False) is True
+        if not isinstance(config, dict):
+            return False
+        plugins = config.get("plugins", {})
+        if not isinstance(plugins, dict):
+            return False
+        entries = plugins.get("entries", {})
+        if not isinstance(entries, dict):
+            return False
+        entry = entries.get("observability/langfuse", {})
+        if not isinstance(entry, dict):
+            return False
+        if "full_content" in entry:
+            return entry["full_content"] is True
+        return _policy_allows_full_content()
     except Exception:
         return False
 

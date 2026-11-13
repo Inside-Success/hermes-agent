@@ -66,6 +66,25 @@ plugins:
       full_content: true
 ```
 
+For a multiplexed deployment where profile configuration has other writers,
+the operator can instead place `langfuse-full-content-policy.json` in the
+process Hermes home. The file must be owned by the process user or root, be a
+regular single-link file with no group/other permissions, and its containing
+process home must not be group/other writable or a symlink. The JSON contains
+`{"version": 1, "profiles": [{"home": "/absolute/profile/home", "device": 1,
+"inode": 2}]}`; use the real profile directory's canonical path and `stat`
+device and inode values. The active profile path must itself be canonical. A
+copy to a different path or device/inode does not inherit permission; inode
+reuse after deletion is possible, so remove an entry when retiring a profile.
+Write the private policy via a
+temporary file and atomic rename, preserving concurrent operator changes.
+An explicit `full_content` setting in the profile takes precedence, including
+`false`; an absent, invalid or unreadable policy enables nothing. A missing
+profile context in a multiplexed process still suppresses capture. The policy
+is an operator coordination mechanism, not a security boundary against another
+process running as the same OS user or root. Replacing a process home or profile
+directory, or changing its permissions, may require reauthorizing the profile.
+
 This sends full prompts, answers, exposed reasoning, tool schemas, arguments and
 results to the configured Langfuse project. Use a project whose access and
 retention are appropriate for those contents. Credential fields, known secret

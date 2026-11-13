@@ -552,3 +552,97 @@ def test_malformed_profile_config_disables_former_opt_in(plugin, tmp_path):
     assert mod._full_content_enabled()
     (tmp_path / "config.yaml").write_text("plugins: [invalid\n")
     assert not mod._full_content_enabled()
+
+
+def _write_process_policy(root, *homes):
+    entries = []
+    for home in homes:
+        info = home.stat()
+        entries.append({"home": str(home.resolve()), "device": info.st_dev, "inode": info.st_ino})
+    path = root / "langfuse-full-content-policy.json"
+    path.write_text(json.dumps({"version": 1, "profiles": entries}))
+    path.chmod(0o600)
+    return path
+
+
+def test_process_policy_is_scoped_across_concurrent_profiles(plugin, tmp_path):
+    import asyncio
+    from contextvars import copy_context
+    from agent.secret_scope import set_multiplex_active, set_secret_scope, reset_secret_scope
+    from hermes_constants import set_hermes_home_override, reset_hermes_home_override
+
+    mod, _, _ = plugin
+    homes = []
+    for name in ("selected", "other"):
+        home = tmp_path / name
+        home.mkdir()
+        (home / "config.yaml").write_text("plugins: {}\n")
+        homes.append(home)
+    _write_process_policy(tmp_path, homes[0])
+
+    async def run(home):
+        profile_token = set_hermes_home_override(home)
+        scope_token = set_secret_scope({"CUSTOM_CREDENTIAL": "profile-specific-secret"})
+        try:
+            await asyncio.sleep(0)
+            return (mod._full_content_enabled(),
+                    await asyncio.to_thread(copy_context().run, mod._full_content_enabled),
+                    mod._content_value("x" * 13000))
+        finally:
+            reset_secret_scope(scope_token)
+            reset_hermes_home_override(profile_token)
+
+    async def both():
+        return await asyncio.gather(*(run(home) for home in homes))
+
+    set_multiplex_active(True)
+    try:
+        selected, other = asyncio.run(both())
+        assert selected[:2] == (True, True)
+        assert other[:2] == (False, False)
+        assert len(selected[2]) == 13000
+        assert len(other[2]) < 13000
+    finally:
+        set_multiplex_active(False)
+
+
+def test_process_policy_fails_closed_and_respects_profile_config(plugin, tmp_path):
+    from hermes_constants import set_hermes_home_override, reset_hermes_home_override
+    mod, _, _ = plugin
+    home = tmp_path / "selected"
+    home.mkdir()
+    config = home / "config.yaml"
+    config.write_text("plugins: {}\n")
+    token = set_hermes_home_override(home)
+    try:
+        assert not mod._full_content_enabled()
+        policy = _write_process_policy(tmp_path, home)
+        assert mod._full_content_enabled()
+        alias = tmp_path / "profile-alias"
+        alias.symlink_to(home, target_is_directory=True)
+        alias_token = set_hermes_home_override(alias)
+        try:
+            assert not mod._full_content_enabled()
+        finally:
+            reset_hermes_home_override(alias_token)
+        config.write_text("plugins:\n  entries:\n    observability/langfuse:\n      full_content: false\n")
+        assert not mod._full_content_enabled()
+        config.write_text("plugins: {}\n")
+        policy.chmod(0o644)
+        assert not mod._full_content_enabled()
+        policy.chmod(0o600)
+        policy.write_text('{"version": true, "profiles": []}')
+        assert not mod._full_content_enabled()
+        _write_process_policy(tmp_path, home)
+        old = home.rename(tmp_path / "original")
+        home.mkdir()
+        (home / "config.yaml").write_text("plugins: {}\n")
+        assert old.stat().st_ino != home.stat().st_ino
+        assert not mod._full_content_enabled()
+        _write_process_policy(tmp_path, home)
+        assert mod._full_content_enabled()
+        other_policy = policy.rename(tmp_path / "other-policy")
+        policy.symlink_to(other_policy)
+        assert not mod._full_content_enabled()
+    finally:
+        reset_hermes_home_override(token)
