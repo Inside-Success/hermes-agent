@@ -178,7 +178,10 @@ def _policy_allows_full_content() -> bool:
     expected = {"home": str(home), "device": home_stat.st_dev, "inode": home_stat.st_ino}
     if not all(isinstance(item, dict) and set(item) == set(expected)
                and isinstance(item["home"], str)
+               and os.path.isabs(item["home"])
+               and os.path.normpath(item["home"]) == item["home"]
                and type(item["device"]) is int and type(item["inode"]) is int
+               and item["device"] >= 0 and item["inode"] > 0
                for item in profiles):
         return False
     return expected in profiles
