@@ -33,6 +33,9 @@ CHAT_PLATFORMS = [
 ]
 
 NOISY_STATUS_MESSAGES = [
+    "⚠️ Empty response from model — retrying (1/3)",
+    "⚠️ Model returned empty after tool calls — nudging to continue",
+    "❌ Model returned no content after all retries. No fallback providers configured.",
     "🗜️ Preflight compression check before sending...",
     (
         "📦 Pre-API compression: ~123,456 tokens near the context/output limit. "

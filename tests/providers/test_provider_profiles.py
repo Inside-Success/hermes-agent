@@ -107,6 +107,26 @@ class TestOpenRouterProfile:
         body = p.build_extra_body(session_id="test-session-123")
         assert body["session_id"] == "test-session-123"
 
+    def test_extra_body_session_id_profile_mode(self, tmp_path, monkeypatch):
+        home = tmp_path / ".hermes" / "profiles" / "reality-brain"
+        home.mkdir(parents=True)
+        (home / "config.yaml").write_text("openrouter:\n  prompt_cache_session: profile\n")
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        p = get_provider_profile("openrouter")
+        a = p.build_extra_body(session_id="20261111_120000_aaaaaa")
+        b = p.build_extra_body(session_id="20261111_120030_bbbbbb")
+        assert a["session_id"] == b["session_id"] == "hermes-reality-brain"
+        assert "session_id" not in p.build_extra_body()
+
+    def test_extra_body_session_id_default_mode_keeps_session(self, tmp_path, monkeypatch):
+        home = tmp_path / ".hermes"
+        home.mkdir(parents=True)
+        (home / "config.yaml").write_text("model:\n  default: x\n")
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        p = get_provider_profile("openrouter")
+        body = p.build_extra_body(session_id="s-1")
+        assert body["session_id"] == "s-1"
+
     def test_extra_body_no_prefs(self):
         p = get_provider_profile("openrouter")
         body = p.build_extra_body()

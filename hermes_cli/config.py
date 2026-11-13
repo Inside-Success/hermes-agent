@@ -1598,10 +1598,16 @@ DEFAULT_CONFIG = {
     #   pick the strongest available coder (router's documented default
     #   when the plugins block is omitted).
     #   See: https://openrouter.ai/docs/guides/routing/routers/pareto-router
+    # prompt_cache_session: which session_id OpenRouter sees, which decides
+    #   whether a new session reuses the cached system prompt. "session"
+    #   (default) sends each Hermes session's own id, so every new session
+    #   writes the prompt to cache again; "profile" sends one stable id per
+    #   profile so sessions share it.
     "openrouter": {
         "response_cache": True,
         "response_cache_ttl": 300,
         "min_coding_score": 0.65,
+        "prompt_cache_session": "session",
     },
 
     # AWS Bedrock provider configuration.
@@ -3064,6 +3070,10 @@ DEFAULT_CONFIG = {
 
     # Gateway settings — control how messaging platforms (Telegram, Discord,
     # Slack, etc.) deliver agent-produced files as native attachments.
+    # Optional validated model policy for unrestricted gateway turns only.
+    # None preserves session model resolution. See docs/turn-model-selection.md.
+    "turn_model_selection": None,
+
     "gateway": {
         # Durable delivery-obligation ledger: final agent responses are
         # recorded in state.db around the platform send, and a gateway that
