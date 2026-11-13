@@ -651,3 +651,64 @@ def test_process_policy_fails_closed_and_respects_profile_config(plugin, tmp_pat
         assert not mod._full_content_enabled()
     finally:
         reset_hermes_home_override(token)
+
+
+def test_process_policy_rejects_untrusted_files_and_revocation(plugin, tmp_path, monkeypatch):
+    import os
+    import stat
+    from hermes_constants import set_hermes_home_override, reset_hermes_home_override
+
+    mod, _, _ = plugin
+    home = tmp_path / "selected"
+    home.mkdir()
+    (home / "config.yaml").write_text("plugins: {}\n")
+    token = set_hermes_home_override(home)
+    try:
+        policy = _write_process_policy(tmp_path, home)
+        assert mod._full_content_enabled()
+        hardlink = tmp_path / "second-link"
+        os.link(policy, hardlink)
+        assert not mod._full_content_enabled()
+        hardlink.unlink()
+        assert mod._full_content_enabled()
+
+        original_fstat = os.fstat
+        def foreign_owner(fd):
+            info = original_fstat(fd)
+            if stat.S_ISREG(info.st_mode):
+                return SimpleNamespace(st_mode=info.st_mode, st_nlink=info.st_nlink,
+                                       st_uid=os.geteuid() + 10000, st_size=info.st_size)
+            return info
+        with monkeypatch.context() as scoped:
+            scoped.setattr(os, "fstat", foreign_owner)
+            assert not mod._full_content_enabled()
+        assert mod._full_content_enabled()
+
+        tmp_path.chmod(0o777)
+        try:
+            assert not mod._full_content_enabled()
+        finally:
+            tmp_path.chmod(0o700)
+        assert mod._full_content_enabled()
+        policy.unlink()
+        assert not mod._full_content_enabled()
+    finally:
+        reset_hermes_home_override(token)
+
+
+def test_process_policy_rejects_symlinked_process_home(plugin, tmp_path, monkeypatch):
+    from hermes_constants import set_hermes_home_override, reset_hermes_home_override
+    mod, _, _ = plugin
+    home = tmp_path / "selected"
+    home.mkdir()
+    (home / "config.yaml").write_text("plugins: {}\n")
+    _write_process_policy(tmp_path, home)
+    token = set_hermes_home_override(home)
+    try:
+        assert mod._full_content_enabled()
+        alias = tmp_path.parent / (tmp_path.name + "-alias")
+        alias.symlink_to(tmp_path, target_is_directory=True)
+        monkeypatch.setenv("HERMES_HOME", str(alias))
+        assert not mod._full_content_enabled()
+    finally:
+        reset_hermes_home_override(token)
