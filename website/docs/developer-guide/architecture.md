@@ -227,6 +227,10 @@ Long-running process with 20 platform adapters, unified session routing, user au
 
 → [Gateway Internals](./gateway-internals.md)
 
+Optional per-turn model policy is resolved before agent-cache lookup; see
+[`docs/turn-model-selection.md`](../../../docs/turn-model-selection.md) for the
+validated configuration and trace receipt contract.
+
 ### Plugin System
 
 Three discovery sources: `~/.hermes/plugins/` (user), `.hermes/plugins/` (project), and pip entry points. Plugins register tools, hooks, and CLI commands through a context API. Two specialized plugin types exist: memory providers (`plugins/memory/`) and context engines (`plugins/context_engine/`). Both are single-select — only one of each can be active at a time, configured via `hermes plugins` or `config.yaml`.

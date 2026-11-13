@@ -15,6 +15,31 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 PLUGIN_DIR = REPO_ROOT / "plugins" / "observability" / "langfuse"
 
 
+def test_selection_receipt_preserves_policy_and_distinct_actual_fallback(monkeypatch):
+    from unittest.mock import MagicMock
+    mod = importlib.import_module("plugins.observability.langfuse")
+    mod._TRACE_STATE.clear()
+    client = MagicMock()
+    root = client.start_as_current_observation.return_value.__enter__.return_value
+    monkeypatch.setattr(mod, "_get_langfuse", lambda: client)
+    monkeypatch.setattr(mod, "propagate_attributes", None)
+    receipt = dict(status="selected", policy_revision="v1", reason="quality evidence",
+                   operation="unrestricted_turn", operation_provenance="gateway",
+                   selected_model="primary", selected_provider="openrouter")
+    for n, actual in enumerate(("primary", "fallback"), 1):
+        mod.on_pre_llm_request(task_id="task", session_id="session", turn_id="turn",
+            api_request_id=f"turn:api:{n}", api_call_count=n,
+            model=actual, provider="openrouter", request_messages=[{"role": "user", "content": "hi"}],
+            model_selection={**receipt, "effective_model": actual, "effective_provider": "openrouter"})
+    root_receipt = client.start_as_current_observation.call_args.kwargs["metadata"]["model_selection"]
+    assert root_receipt["selected_model"] == "primary"
+    generations = root.start_observation.call_args_list
+    assert [call.kwargs["model"] for call in generations] == ["primary", "fallback"]
+    assert [call.kwargs["metadata"]["model_selection"]["effective_model"] for call in generations] == ["primary", "fallback"]
+    assert all(call.kwargs["metadata"]["model_selection"]["policy_revision"] == "v1" for call in generations)
+    mod._TRACE_STATE.clear()
+
+
 # ---------------------------------------------------------------------------
 # Manifest + layout
 # ---------------------------------------------------------------------------

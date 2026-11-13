@@ -29,6 +29,47 @@ _ANTHROPIC_REASONING_OPTIONAL_SUBSTRINGS = (
 )
 
 
+def _openrouter_session_id(session_id: str | None) -> str | None:
+    """Return the ``session_id`` to send to OpenRouter.
+
+    OpenRouter routes prompt caching by ``session_id``: a request with an
+    identical prompt prefix but a new ``session_id`` writes the whole prefix
+    to cache again instead of reading it (measured 2026-11-11 on
+    openai/gpt-6-luna: same id -> 10,830 cached tokens read; new id or no id
+    -> 10,830 tokens written). Hermes sends a fresh session id per session, so
+    every new gateway question or cron run pays a full cache write for the
+    system prompt that the previous session already cached.
+
+    ``openrouter.prompt_cache_session`` in config.yaml chooses the key:
+    ``session`` (default, upstream behaviour) sends the Hermes session id;
+    ``profile`` sends one stable id per profile (``hermes-<profile>``) so
+    sessions of the same profile share the cached system prompt.
+    """
+    if not session_id:
+        # Calls without a session (auxiliary tasks) keep upstream behaviour.
+        return session_id
+    mode = "session"
+    try:
+        from hermes_cli.config import load_config_readonly
+
+        mode = str(
+            (load_config_readonly().get("openrouter") or {}).get("prompt_cache_session")
+            or "session"
+        ).strip().lower()
+    except Exception as exc:  # config unreadable: keep upstream behaviour
+        logger.debug("openrouter prompt_cache_session: %s", exc)
+    if mode != "profile":
+        return session_id
+    try:
+        from hermes_constants import get_hermes_home
+
+        home = get_hermes_home()
+        name = home.name if home.parent.name == "profiles" else "default"
+    except Exception:
+        name = "default"
+    return f"hermes-{name}"
+
+
 def _anthropic_reasoning_is_mandatory(model: str | None) -> bool:
     """Return True for Anthropic models that reject any disable-thinking form.
 
@@ -77,8 +118,9 @@ class OpenRouterProfile(ProviderProfile):
         self, *, session_id: str | None = None, **context: Any
     ) -> dict[str, Any]:
         body: dict[str, Any] = {}
-        if session_id:
-            body["session_id"] = session_id
+        sid = _openrouter_session_id(session_id)
+        if sid:
+            body["session_id"] = sid
         prefs = context.get("provider_preferences")
         if prefs:
             body["provider"] = prefs

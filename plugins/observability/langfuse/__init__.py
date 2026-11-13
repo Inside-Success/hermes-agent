@@ -602,7 +602,8 @@ def _usage_and_cost(response: Any, *, provider: str, api_mode: str, model: str, 
 
 def _start_root_trace(task_key: str, *, task_id: str, session_id: str, platform: str, provider: str, model: str,
                       api_mode: str, messages: Any, client: Langfuse,
-                      turn_id: str = "", api_request_id: str = "") -> TraceState:
+                      turn_id: str = "", api_request_id: str = "",
+                      model_selection: Optional[dict] = None) -> TraceState:
     trace_id = client.create_trace_id(seed=f"{session_id or 'sessionless'}::{task_id or task_key}")
     trace_input = _extract_last_user_message(messages)
     metadata = {
@@ -615,6 +616,9 @@ def _start_root_trace(task_key: str, *, task_id: str, session_id: str, platform:
         "model": model,
         "api_mode": api_mode,
     }
+
+    if model_selection is not None:
+        metadata["model_selection"] = _safe_value(model_selection)
 
     # session_id must be passed in trace_context for Langfuse session grouping.
     trace_ctx: Dict[str, Any] = {"trace_id": trace_id}
@@ -845,6 +849,7 @@ def on_pre_llm_request(
     user_message: Any = None,
     turn_id: str = "",
     api_request_id: str = "",
+    model_selection: Optional[dict] = None,
     **_: Any,
 ) -> None:
     client = _get_langfuse()
@@ -881,6 +886,7 @@ def on_pre_llm_request(
                 client=client,
                 turn_id=turn_id,
                 api_request_id=api_request_id,
+                model_selection=model_selection,
             )
             _evict_stale_locked()
             _TRACE_STATE[task_key] = state
@@ -899,6 +905,8 @@ def on_pre_llm_request(
                 "platform": platform,
                 "api_mode": api_mode,
                 "base_url": base_url,
+                **({"model_selection": _safe_value(model_selection)}
+                   if model_selection is not None else {}),
             },
             model=model,
             model_parameters={"api_mode": api_mode, "provider": provider},
