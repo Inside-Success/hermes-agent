@@ -163,8 +163,32 @@ def _full_value(value: Any) -> Any:
                 # part of the tool contract. Their defaults/examples are DATA,
                 # so a schema context must never exempt them from redaction.
                 result = {}
+                # A Python mapping key can be bytes, a tuple containing bytes,
+                # or an arbitrary object's repr. Never stringify those keys:
+                # doing so can disclose both the key and its sensitive value.
+                # Reserve the cleaned text keys so omission markers cannot
+                # overwrite even a later literal key with the same name.
+                reserved = {text_value(key) for key in item if isinstance(key, str)}
+
+                def unique_key(base: str) -> str:
+                    name = base
+                    suffix = 1
+                    while name in result or (name != base and name in reserved):
+                        name = f"{base} [{suffix}]"
+                        suffix += 1
+                    return name
+
                 for key, val in item.items():
-                    safe_key = text_value(str(key))
+                    if not isinstance(key, str):
+                        base = "[omitted non-string key]"
+                        safe_key = base
+                        suffix = 1
+                        while safe_key in reserved or safe_key in result:
+                            safe_key = f"{base} [{suffix}]"
+                            suffix += 1
+                        result[safe_key] = "[OMITTED: non-string mapping key]"
+                        continue
+                    safe_key = unique_key(text_value(key))
                     if schema_map:
                         safe_val = copy(val, schema=True, credential_schema=_sensitive_content_key(key))
                     elif schema:
@@ -188,7 +212,10 @@ def _full_value(value: Any) -> Any:
             if isinstance(item, (list, tuple, set)):
                 return [copy(v, schema=schema, credential_schema=credential_schema) for v in item]
             if isinstance(item, BaseException):
-                return {"type": type(item).__name__, "message": text_value(str(item))}
+                if all(isinstance(arg, (str, int, float, bool, type(None))) for arg in item.args):
+                    return {"type": type(item).__name__, "message": text_value(str(item))}
+                # Exception repr embeds arbitrary arguments (including bytes).
+                return {"type": type(item).__name__, "arguments": copy(item.args)}
             if callable(getattr(item, "model_dump", None)):
                 return copy(item.model_dump(mode="python"))
             if hasattr(item, "__dict__"):

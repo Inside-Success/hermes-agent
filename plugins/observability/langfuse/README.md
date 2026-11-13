@@ -89,7 +89,10 @@ normalization. Original JSON strings are preserved except where credentials need
 redacting. Unsupported non-JSON objects and cycles receive explicit omission
 markers. Bytes and bytearrays are omitted with their length recorded: opaque
 binary may contain credentials that cannot reliably be identified by text
-redaction. Arbitrary metadata stays bounded.
+redaction. Non-string mapping keys and their values are also omitted to avoid
+exposing binary through a string representation; exception arguments containing
+non-scalar values are copied with the same omission rules. Arbitrary metadata
+stays bounded.
 
 The scope is source data available at Hermes dispatch, not serialized HTTP wire
 bytes, SDK-internal HTTP retries, transport-only stream/timeout settings, or

@@ -229,6 +229,58 @@ def test_byte_credentials_are_not_exported_in_nested_requests_or_tool_results(pl
     assert '"omitted": true' in observed
 
 
+def test_nonstring_mapping_keys_cannot_leak_or_overwrite_other_keys(plugin):
+    mod, _, _ = plugin
+    secret = b"synthetic-secret-in-key"
+    value = {"[omitted non-string key]": "existing", secret: "hidden value",
+             ("nested", secret): "another hidden value", "other": "preserved"}
+    captured = mod._full_value(value)
+    serialized = json.dumps(captured)
+    assert secret.decode() not in serialized
+    assert "hidden value" not in serialized
+    assert captured["[omitted non-string key]"] == "existing"
+    assert captured["other"] == "preserved"
+    assert len(captured) == len(value)
+    assert sum(v == "[OMITTED: non-string mapping key]" for v in captured.values()) == 2
+
+
+def test_exception_byte_arguments_are_never_stringified_for_export(plugin):
+    mod, _, _ = plugin
+    secret = b"synthetic-secret-in-exception"
+    captured = mod._full_value(ValueError(secret, {"nested": [secret]}))
+    serialized = json.dumps(captured)
+    assert secret.decode() not in serialized
+    assert base64.b64encode(secret).decode() not in serialized
+    assert "opaque binary may contain credentials" in serialized
+
+
+def test_real_sdk_excludes_binary_keys_from_request_and_tool_result(plugin, monkeypatch):
+    langfuse = pytest.importorskip("langfuse")
+    from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
+
+    mod, _, hooks = plugin
+    exporter = InMemorySpanExporter()
+    client = langfuse.Langfuse(public_key="pk-lf-test-binary-key", secret_key="sk-lf-test",
+                              span_exporter=exporter, sample_rate=1.0)
+    monkeypatch.setattr(mod, "_get_langfuse", lambda: client)
+    secret = b"synthetic-secret-in-binary-key"
+    try:
+        hooks["pre_api_attempt"](request={"nested": {secret: "private-key-value"}}, **attempt_kwargs())
+        hooks["pre_tool_call"](tool_name="example", args={}, tool_call_id="tool", **attempt_kwargs())
+        hooks["post_tool_call"](tool_name="example", args={}, result={"nested": {("a", secret): "private-value"}},
+                                tool_call_id="tool", **attempt_kwargs())
+        hooks["post_api_attempt"](response={"content": "safe"}, **attempt_kwargs())
+        hooks["post_llm_call"](task_id="task", session_id="session", turn_id="turn", assistant_response="safe")
+        client.flush()
+        attributes = json.dumps([dict(span.attributes) for span in exporter.get_finished_spans()])
+        assert secret.decode() not in attributes
+        assert "private-key-value" not in attributes
+        assert "private-value" not in attributes
+        assert "[OMITTED: non-string mapping key]" in attributes
+    finally:
+        client.shutdown()
+
+
 def test_credential_key_variants_preserve_usage_and_schema_definitions(plugin):
     mod, _, _ = plugin
     controls = {"input_tokens": 12, "output_tokens": 5, "reasoning_tokens": 3,
