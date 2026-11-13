@@ -76,12 +76,17 @@ Credential-named schema properties keep their definitions; credential defaults,
 constants and examples are filtered as values. Encoded JSON string layers are
 checked recursively, while non-secret strings retain their original formatting.
 
-Full mode records separate generations for every **Hermes dispatch attempt**,
-including failed attempts and retries, through `pre_api_attempt` and
+Full mode records separate generations for observed **Hermes dispatch attempts**
+through `pre_api_attempt` and
 `post_api_attempt`. It snapshots final dispatch kwargs after execution middleware
 and provider preflight, then captures the returned SDK object or error. Available
 usage and estimated cost follow the existing pricing path. Metadata identifies
 `full_content: true`, `captured_scope: hermes_dispatch_attempt`, and `redacted: true`.
+OpenAI-compatible and Anthropic streaming retries are recorded individually;
+failed streams include the content and reasoning received before the error.
+Bedrock's streaming fallback and the Codex streaming adapter remain observed at
+the outer helper boundary, so their internal dispatch attempts are not yet
+individually established. An interrupted observation may lack partial output.
 
 JSON model source content has no plugin message-count, string-length, container-size
 or nesting-depth preview limits. Tool output also bypasses `read_file` preview
@@ -95,7 +100,7 @@ non-scalar values are copied with the same omission rules. Arbitrary metadata
 stays bounded.
 
 The scope is source data available at Hermes dispatch, not serialized HTTP wire
-bytes, SDK-internal HTTP retries, transport-only stream/timeout settings, or
+bytes, SDK-internal HTTP retries, a guarantee of transport-only settings, or
 reasoning a provider does not expose. Langfuse SDK media handling, sampling and
 server/exporter limits still apply; verify stored content before relying on a
 deployment's complete-capture claim. Keep sampling at 1.0 when every run is needed.

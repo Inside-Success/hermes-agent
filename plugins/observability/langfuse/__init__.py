@@ -1117,7 +1117,7 @@ def on_pre_api_attempt(*, request: Any = None, api_attempt_id: str = "",
         )
 
 
-def on_post_api_attempt(*, response: Any = None, error: Any = None,
+def on_post_api_attempt(*, response: Any = None, error: Any = None, partial: Any = None,
                         api_attempt_id: str = "", task_id: str = "", session_id: str = "",
                         turn_id: str = "", api_request_id: str = "", provider: str = "",
                         model: str = "", api_mode: str = "", base_url: str = "",
@@ -1130,7 +1130,7 @@ def on_post_api_attempt(*, response: Any = None, error: Any = None,
         generation = state.generations.pop(api_attempt_id, None) if state else None
     if generation is None:
         return
-    output = {"error": _full_value(error)} if error is not None else _full_value(response)
+    output = {"error": _full_value(error), "partial": _full_value(partial)} if error is not None else _full_value(response)
     usage_details, cost_details = _usage_and_cost(
         response, provider=provider, api_mode=api_mode, model=model, base_url=base_url,
     )

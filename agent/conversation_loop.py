@@ -2090,30 +2090,67 @@ def run_conversation(
                         "request": next_api_kwargs,
                     }
 
-                    def observe_attempt(event, **payload):
+                    def observe_attempt(event, context=None, **payload):
                         try:
                             from hermes_cli.plugins import has_hook, invoke_hook
                             if has_hook(event):
-                                invoke_hook(event, **attempt_context, **payload)
+                                invoke_hook(event, **(context or attempt_context), **payload)
                         except Exception:
                             logger.debug("Model attempt observer failed", exc_info=True)
 
-                    observe_attempt("pre_api_attempt")
+                    stream_observed = {"started": False}
+                    stream_lock = threading.Lock()
+                    stream_open = {}
+
+                    def observe_stream(event, *, number, request=None, started_at=None, **payload):
+                        context = dict(attempt_context)
+                        context["api_attempt_id"] = f"{attempt_context['api_attempt_id']}:stream:{number}"
+                        with stream_lock:
+                            if event == "pre":
+                                stream_observed["started"] = True
+                                context["request"] = request
+                                context["started_at"] = started_at
+                                stream_open[number] = context
+                                observe_attempt("pre_api_attempt", context=context)
+                            elif number in stream_open:
+                                context = stream_open.pop(number)
+                                observe_attempt("post_api_attempt", context=context, **payload)
+
+                    def close_unfinished_streams(error):
+                        with stream_lock:
+                            ended = time.time()
+                            for context in stream_open.values():
+                                observe_attempt("post_api_attempt", context=context, response=None,
+                                                error=error, ended_at=ended,
+                                                duration=ended - context["started_at"])
+                            stream_open.clear()
+
+                    if not _use_streaming:
+                        observe_attempt("pre_api_attempt")
                     try:
                         if _use_streaming:
                             attempt_response = agent._interruptible_streaming_api_call(
-                                next_api_kwargs, on_first_delta=_stop_spinner
+                                next_api_kwargs, on_first_delta=_stop_spinner,
+                                attempt_observer=observe_stream,
                             )
                         else:
                             attempt_response = agent._interruptible_api_call(next_api_kwargs)
                     except BaseException as exc:
                         ended_at = time.time()
-                        observe_attempt("post_api_attempt", response=None, error=exc,
-                                        ended_at=ended_at, duration=ended_at - attempt_started)
+                        close_unfinished_streams(exc)
+                        if not stream_observed["started"]:
+                            if _use_streaming:
+                                observe_attempt("pre_api_attempt")
+                            observe_attempt("post_api_attempt", response=None, error=exc,
+                                            ended_at=ended_at, duration=ended_at - attempt_started)
                         raise
                     ended_at = time.time()
-                    observe_attempt("post_api_attempt", response=attempt_response, error=None,
-                                    ended_at=ended_at, duration=ended_at - attempt_started)
+                    close_unfinished_streams(RuntimeError("stream observer ended before dispatch completed"))
+                    if not stream_observed["started"]:
+                        if _use_streaming:
+                            observe_attempt("pre_api_attempt")
+                        observe_attempt("post_api_attempt", response=attempt_response, error=None,
+                                        ended_at=ended_at, duration=ended_at - attempt_started)
                     return attempt_response
 
                 from hermes_cli.middleware import run_llm_execution_middleware

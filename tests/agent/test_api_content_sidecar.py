@@ -620,6 +620,120 @@ def _user_messages(req: dict) -> list:
 
 
 class TestWireInvariant:
+    def test_partial_stream_error_keeps_content_and_reasoning_in_export(self, wire_env, monkeypatch):
+        import importlib
+        import httpx
+        from types import SimpleNamespace
+        langfuse = pytest.importorskip("langfuse")
+        from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
+
+        make_agent, handler, _, _ = wire_env
+        agent = make_agent()
+        agent.stream_delta_callback = lambda text: None
+        handler.response_queue.append(_text_resp("done"))
+        original_create = agent._create_request_openai_client
+        dispatches = []
+
+        def failed_stream():
+            delta = SimpleNamespace(content="partial answer", reasoning_content="partial reasoning",
+                                    reasoning=None, tool_calls=None)
+            yield SimpleNamespace(choices=[SimpleNamespace(delta=delta, finish_reason=None)],
+                                  model="test-model", usage=None)
+            raise httpx.RemoteProtocolError("synthetic partial stream failure")
+
+        def client_for_attempt(*args, **kwargs):
+            dispatches.append(1)
+            if len(dispatches) == 1:
+                fake = MagicMock()
+                fake.chat.completions.create.return_value = failed_stream()
+                return fake
+            return original_create(*args, **kwargs)
+
+        plugin = importlib.import_module("plugins.observability.langfuse")
+        exporter = InMemorySpanExporter()
+        client = langfuse.Langfuse(public_key="pk-lf-test-stream-partial", secret_key="sk-lf-test",
+                                  span_exporter=exporter, sample_rate=1.0)
+        monkeypatch.setattr(plugin, "_FULL_CONTENT", True)
+        monkeypatch.setattr(plugin, "_get_langfuse", lambda: client)
+        monkeypatch.setattr(plugin, "propagate_attributes", None)
+        hooks = {"pre_api_attempt": plugin.on_pre_api_attempt,
+                 "post_api_attempt": plugin.on_post_api_attempt,
+                 "post_llm_call": plugin.on_post_llm_call}
+
+        def invoke(event, **payload):
+            if event in hooks:
+                hooks[event](**payload)
+            return []
+
+        try:
+            with patch.object(agent, "_create_request_openai_client", side_effect=client_for_attempt), \
+                 patch("hermes_cli.plugins.has_hook", side_effect=lambda event: event in hooks), \
+                 patch("hermes_cli.plugins.invoke_hook", side_effect=invoke):
+                agent.run_conversation("read evidence", conversation_history=[], task_id="t")
+            client.flush()
+            generations = [s for s in exporter.get_finished_spans() if s.name.startswith("LLM attempt ")]
+            errors = [s for s in generations if s.attributes.get("langfuse.observation.metadata.status") == "error"]
+            assert errors
+            output = json.loads(errors[0].attributes["langfuse.observation.output"])
+            assert output["partial"]["content"] == "partial answer"
+            assert output["partial"]["reasoning"] == "partial reasoning"
+            assert "synthetic partial stream failure" in output["error"]["message"]
+        finally:
+            client.shutdown()
+
+    def test_stream_retries_create_one_exported_generation_per_dispatch(self, wire_env, monkeypatch):
+        import importlib
+        import httpx
+        langfuse = pytest.importorskip("langfuse")
+        from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
+
+        make_agent, handler, _, _ = wire_env
+        agent = make_agent()
+        agent.stream_delta_callback = lambda text: None
+        handler.response_queue.append(_text_resp("done"))
+        original_create = agent._create_request_openai_client
+        dispatches = []
+
+        def client_for_attempt(*args, **kwargs):
+            dispatches.append(1)
+            if len(dispatches) <= 2:
+                fake = MagicMock()
+                fake.chat.completions.create.side_effect = httpx.RemoteProtocolError("synthetic connection drop")
+                return fake
+            return original_create(*args, **kwargs)
+
+        plugin = importlib.import_module("plugins.observability.langfuse")
+        exporter = InMemorySpanExporter()
+        client = langfuse.Langfuse(public_key="pk-lf-test-stream-retries", secret_key="sk-lf-test",
+                                  span_exporter=exporter, sample_rate=1.0)
+        monkeypatch.setattr(plugin, "_FULL_CONTENT", True)
+        monkeypatch.setattr(plugin, "_get_langfuse", lambda: client)
+        monkeypatch.setattr(plugin, "propagate_attributes", None)
+        monkeypatch.setenv("HERMES_STREAM_RETRIES", "2")
+        hooks = {"pre_api_attempt": plugin.on_pre_api_attempt,
+                 "post_api_attempt": plugin.on_post_api_attempt,
+                 "post_llm_call": plugin.on_post_llm_call}
+
+        def invoke(event, **payload):
+            if event in hooks:
+                hooks[event](**payload)
+            return []
+
+        try:
+            with patch.object(agent, "_create_request_openai_client", side_effect=client_for_attempt), \
+                 patch("hermes_cli.plugins.has_hook", side_effect=lambda event: event in hooks), \
+                 patch("hermes_cli.plugins.invoke_hook", side_effect=invoke):
+                agent.run_conversation("read evidence", conversation_history=[], task_id="t")
+            client.flush()
+            generations = [span for span in exporter.get_finished_spans() if span.name.startswith("LLM attempt ")]
+            assert len(dispatches) == 3
+            assert len(generations) == 3
+            assert len({s.name for s in generations}) == 3
+            assert sorted(s.attributes["langfuse.observation.metadata.status"] for s in generations) == ["error", "error", "success"]
+            assert all(json.loads(s.attributes["langfuse.observation.input"])["stream"] for s in generations)
+        finally:
+            client.shutdown()
+
     def test_redirect_restart_keeps_dispatch_attempt_ids_unique(self, wire_env):
         make_agent, handler, db, sid = wire_env
         agent = make_agent()
