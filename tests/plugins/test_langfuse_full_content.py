@@ -1,6 +1,7 @@
 """Opt-in complete model content at the Langfuse SDK boundary (no network)."""
 from __future__ import annotations
 
+import base64
 import importlib
 import json
 import sys
@@ -207,8 +208,25 @@ def test_non_json_types_are_explicit_and_json_safe(plugin):
     cycle.append(cycle)
     safe = mod._full_value({"bytes": b"abc", "not_finite": float("nan"), "cycle": cycle})
     json.dumps(safe, allow_nan=False)
-    assert safe["bytes"]["data"] == "YWJj"
+    assert safe["bytes"] == {"type": "bytes", "omitted": True,
+                             "reason": "opaque binary may contain credentials", "length": 3}
     assert safe["cycle"][0]["reason"] == "cyclic non-JSON value"
+
+
+def test_byte_credentials_are_not_exported_in_nested_requests_or_tool_results(plugin):
+    _, client, hooks = plugin
+    secret = b"synthetic-opaque-credential"
+    hooks["pre_api_attempt"](request={"ordinary": [bytearray(secret), {"payload": b"\xff" + secret}]},
+                              **attempt_kwargs())
+    hooks["pre_tool_call"](tool_name="example", args={}, tool_call_id="tool", **attempt_kwargs())
+    hooks["post_tool_call"](tool_name="example", args={}, result={"payload": secret},
+                            tool_call_id="tool", **attempt_kwargs())
+    generation, tool = client.roots[0].children
+    observed = json.dumps([generation.started, tool.updates])
+    assert secret.decode() not in observed
+    for raw in (secret, b"\xff" + secret):
+        assert base64.b64encode(raw).decode() not in observed
+    assert '"omitted": true' in observed
 
 
 def test_credential_key_variants_preserve_usage_and_schema_definitions(plugin):
@@ -244,7 +262,11 @@ def test_real_sdk_exports_complete_model_content(plugin, monkeypatch):
         {"role": "tool", "content": json.dumps(formatted_json)},
     ])
     request["headers"] = {"Authorization": "Bearer opaque-sdk-credential"}
-    expected_request = {**request, "headers": {"Authorization": "[REDACTED]"}}
+    request["attachment"] = b"synthetic-sdk-byte-secret"
+    expected_request = {**request, "headers": {"Authorization": "[REDACTED]"},
+                        "attachment": {"type": "bytes", "omitted": True,
+                                       "reason": "opaque binary may contain credentials",
+                                       "length": len(request["attachment"])}}
     response = {"choices": [{"message": {"content": "a" * 16000,
                  "reasoning": "r" * 17000, "tool_calls": [{"id": str(i)} for i in range(75)]}}]}
     try:
@@ -262,6 +284,7 @@ def test_real_sdk_exports_complete_model_content(plugin, monkeypatch):
         assert generation.attributes["langfuse.observation.metadata.redacted"] is True
         assert "opaque-sdk-credential" not in json.dumps(dict(generation.attributes))
         assert "opaque-url-credential" not in json.dumps(dict(generation.attributes))
+        assert base64.b64encode(request["attachment"]).decode() not in json.dumps(dict(generation.attributes))
     finally:
         client.shutdown()
 

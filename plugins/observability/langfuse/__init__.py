@@ -22,7 +22,6 @@ Optional env vars:
 """
 from __future__ import annotations
 
-import base64
 import json
 import logging
 import math
@@ -150,7 +149,10 @@ def _full_value(value: Any) -> Any:
         if isinstance(item, str):
             return text_value(item)
         if isinstance(item, (bytes, bytearray)):
-            return {"type": "bytes", "encoding": "base64", "data": base64.b64encode(item).decode("ascii")}
+            # Binary data can encode credentials in arbitrary forms, so neither
+            # text redaction nor a base64 wrapper makes it safe to export.
+            return {"type": "bytes", "omitted": True,
+                    "reason": "opaque binary may contain credentials", "length": len(item)}
         ident = id(item)
         if ident in active:
             return {"omitted": True, "reason": "cyclic non-JSON value", "type": type(item).__name__}

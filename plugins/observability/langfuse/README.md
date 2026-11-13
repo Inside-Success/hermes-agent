@@ -87,7 +87,9 @@ JSON model source content has no plugin message-count, string-length, container-
 or nesting-depth preview limits. Tool output also bypasses `read_file` preview
 normalization. Original JSON strings are preserved except where credentials need
 redacting. Unsupported non-JSON objects and cycles receive explicit omission
-markers; bytes receive a base64 representation. Arbitrary metadata stays bounded.
+markers. Bytes and bytearrays are omitted with their length recorded: opaque
+binary may contain credentials that cannot reliably be identified by text
+redaction. Arbitrary metadata stays bounded.
 
 The scope is source data available at Hermes dispatch, not serialized HTTP wire
 bytes, SDK-internal HTTP retries, transport-only stream/timeout settings, or
