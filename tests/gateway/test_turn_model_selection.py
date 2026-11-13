@@ -10,7 +10,7 @@ from gateway.config import Platform
 from gateway.session import SessionSource
 from tests.gateway.test_compression_failure_session_sync import (
     _runner, _SessionStore, _install_compression_failure_agent,
-    _run_compression_failure_turn,
+    _run_compression_failure_turn, _CompressionThenFailureAgent,
 )
 from tests.gateway.test_background_command import _make_runner
 
@@ -132,3 +132,56 @@ def test_concurrent_resolutions_do_not_mutate_runner_or_session():
         routes = list(pool.map(resolve, range(8)))
     assert [route["model"] for route in routes] == [str(n) for n in range(8)]
     assert runner._service_tier == "sentinel"
+
+
+@pytest.mark.parametrize("provider, selected, canonical", [
+    ("deepseek", "deepseek/deepseek-v4-pro", "deepseek-v4-pro"),
+    ("anthropic", "anthropic/claude-sonnet-4.6", "claude-sonnet-4-6"),
+    ("openrouter", "openai/gpt-6.1-terra", "openai/gpt-6.1-terra"),
+])
+def test_successful_turn_reuses_native_canonical_model_but_rejects_fallback(
+        monkeypatch, provider, selected, canonical):
+    import sys
+    from gateway.turn_model_selection import runtime_model_identity
+    _install_compression_failure_agent(monkeypatch)
+    created = []
+
+    class SuccessfulAgent(_CompressionThenFailureAgent):
+        def __init__(self, **kwargs):
+            super().__init__(**kwargs)
+            self.provider = kwargs["provider"]
+            self.model = runtime_model_identity(self.model, self.provider)
+            created.append(self)
+
+        def run_conversation(self, user_message, **kwargs):
+            if getattr(self, "activate_fallback", False):
+                self.model = "different-fallback"
+            return {"final_response": "done", "messages": [], "api_calls": 1}
+
+    monkeypatch.setattr(sys.modules["run_agent"], "AIAgent", SuccessfulAgent)
+    runner = _runner(_SessionStore())
+    runner._resolve_turn_agent_config = gateway_run.GatewayRunner._resolve_turn_agent_config.__get__(runner)
+    runner._resolve_session_agent_runtime = lambda **kw: ("original", {"provider": provider, "api_key": "test"})
+    runner._agent_config_signature = gateway_run.GatewayRunner._agent_config_signature
+    runner._is_intentional_model_switch = lambda *args: False
+    runner._evict_cached_agent = lambda key: runner._agent_cache.pop(key, None)
+    config = {"turn_model_selection": {**policy(selected), "provider": provider}}
+    monkeypatch.setattr(gateway_run, "_load_gateway_config", lambda: config)
+    monkeypatch.setattr(gateway_run, "_resolve_gateway_model", lambda: "original")
+    source = SessionSource(platform=Platform.TELEGRAM, chat_id="12345", user_id="user-1")
+    _run_compression_failure_turn(runner, source)
+    _run_compression_failure_turn(runner, source)
+    assert len(created) == 1
+    assert next(iter(runner._agent_cache.values()))[0] is created[0]
+    assert created[0].model == canonical
+    assert created[0].turn_model_selection["selected_model"] == selected
+    created[0].model = "different-fallback"
+    _run_compression_failure_turn(runner, source)
+    assert len(created) == 2
+    assert created[1].model == canonical
+    created[1].activate_fallback = True
+    _run_compression_failure_turn(runner, source)
+    assert not runner._agent_cache
+    _run_compression_failure_turn(runner, source)
+    assert len(created) == 3
+    assert created[2].model == canonical

@@ -5,6 +5,15 @@ from typing import Any
 _FIELDS = {"policy_revision", "operation", "reason", "model", "provider"}
 
 
+def runtime_model_identity(model: str, provider: str) -> str:
+    """Use the same native-provider normalization as AIAgent construction."""
+    from hermes_cli.model_normalize import _AGGREGATOR_PROVIDERS, normalize_model_for_provider
+
+    if provider and provider not in _AGGREGATOR_PROVIDERS:
+        return normalize_model_for_provider(model, provider)
+    return model
+
+
 def select_turn_model(policy: Any, model: str, provider: str) -> tuple[str, dict | None]:
     """Keep provider credentials scoped to the resolved runtime; reject bad policy.
 

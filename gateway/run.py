@@ -21491,12 +21491,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     pass
 
             _xproc_evicted_agent = None
+            from gateway.turn_model_selection import runtime_model_identity
             if _cache_lock and _cache is not None:
                 with _cache_lock:
                     cached = _cache.get(session_key)
                     if (cached and cached[1] == _sig and (
                         (turn_route.get("model_selection") or {}).get("status") != "selected" or (
-                            getattr(cached[0], "model", None) == turn_route["model"]
+                            getattr(cached[0], "model", None) == runtime_model_identity(
+                                turn_route["model"], turn_route["runtime"].get("provider")
+                            )
                             and getattr(cached[0], "provider", None) == turn_route["runtime"].get("provider")
                         )
                     )):
@@ -23038,6 +23041,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             _run_failed = _result_for_fb.get("failed") if _result_for_fb else False
             if _agent is not None and hasattr(_agent, 'model') and not _run_failed:
                 _cfg_model = _resolve_gateway_model()
+                _selection = getattr(_agent, "turn_model_selection", None) or {}
+                if _selection.get("status") == "selected":
+                    _cfg_model = _selection["selected_model"]
                 # Normalize _cfg_model the same way AIAgent.__init__ does, so a
                 # vendor-prefixed config value (e.g. "deepseek/deepseek-v4-pro")
                 # matches the agent's stripped model ("deepseek-v4-pro") on

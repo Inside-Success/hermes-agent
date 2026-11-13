@@ -32,7 +32,10 @@ do not share mutable request settings. Fast-mode overrides use the selected
 model. Same effective configuration reuses the cached agent; policy revision
 and explanation alone do not invalidate it. A model change uses the existing
 agent-cache transition. A cached fallback model cannot silently override a new
-policy selection.
+policy selection. Cache identity uses the same native-provider model-name
+normalization as agent construction; the receipt retains the configured spelling.
+After a successful turn, fallback detection compares against the selected target
+instead of the profile's default model.
 
 The existing `pre_api_request` hook carries `model_selection`: policy revision,
 reason, operation/provenance, status, selected model/provider, and each request's
