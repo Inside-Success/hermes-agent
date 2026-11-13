@@ -64,3 +64,49 @@ existing journey consumers; it does not complete A78 skill mutation or enforce
 policy against raw terminal/file writes. Existing scan, validation, approval and
 prompt-cache owners remain in place. Historical provenance is never backfilled
 from mtime or position. Revision retention is unbounded in this slice.
+
+## Independent review corrections — 2026-11-13
+
+The first candidate `5a919aa861186245402783325b89266d22753bb4` remained local.
+Independent review reproduced four gaps despite the focused green suite:
+reserved delimiters could produce a journal item count different from Markdown
+reload; text-mode newline translation could diverge from the after hash and
+existing CRLF files parsed incorrectly; initial frozen-prompt loading skipped
+pending recovery; and redirected journey list output wrapped handles.
+
+The correction first ran the new reproductions against that candidate:
+`tests/tools/test_native_memory_revisions.py` returned **26 passed, 24 failed,
+exit 1**, measured 19.4 seconds. This included 20 reserved-separator cases across
+add/replace/batch/journey and four newline/snapshot/CLI seam cases. Subsequent
+controls verify valid writes remain usable, exact CRLF-before/LF-after recovery
+works at initial loading, cached conversations remain unchanged, and invalid
+content cannot enter approval staging.
+
+Final corrective commands used the same required runner, environment and
+`--file-retries 0 -q -j 2` options above:
+
+- Ten affected files (`test_native_memory_revisions`, `test_memory_tool`,
+  `test_write_approval`, `test_learning_mutations`, `test_learning_graph`,
+  `test_journey_render`, `test_background_review_cache_parity`,
+  `test_background_review_summary`, `test_memory_tool_import_fallback`, and
+  `test_memory_tool_schema`): **222 passed, exit 0**, measured 28.0 seconds.
+- `tests/run_agent/test_run_agent.py -k memory`: **14 passed, exit 0**,
+  measured 4.6 seconds.
+- Ruff over the three corrective Python files: no issues, exit 0.
+- `openspec validate --specs --strict`: 1 specification passed, exit 0.
+- `git diff --check`: no whitespace errors, exit 0.
+
+The revision test file now has 54 passing cases. These corrective runs cover
+236 tests in 11 files. Earlier SessionDB and other nearby results remain
+historical evidence; they are not represented as rerun after the correction.
+Windows translation was simulated locally; no real Windows execution is claimed.
+
+### Pre-landing coverage lesson
+
+The earlier 696-test result accurately described tests executed against a local
+candidate, not a full A78, shipping or activation certification. Independent
+pre-landing review added decisive representation and entry-point controls:
+compare persisted bytes, fresh Markdown parsing and journal identities; exercise
+initial prompt loading as well as live readers; and round-trip the actual printed
+handle into the next documented command. This note extends the existing receipt;
+no separate verification/certification artifact or Project Meta mutation was added.

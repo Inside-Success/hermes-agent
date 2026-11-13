@@ -88,9 +88,22 @@ ENTRY_DELIMITER = "\n§\n"
 from tools.threat_patterns import first_threat_message as _first_threat_message
 
 
+def _normalize_memory_text(content: str) -> str:
+    """Logical Markdown text uses LF; recovery hashes retain the exact raw bytes."""
+    return content.replace('\r\n', '\n').replace('\r', '\n')
+
+
+def _reserved_entry_error(content: str) -> Optional[str]:
+    # Boundary lines matter too: a trailing section sign would become a
+    # separator when a later entry is appended, silently shifting identities.
+    if '§' in _normalize_memory_text(content).strip().split('\n'):
+        return "A standalone § line is reserved for separating memory entries; submit separate entries instead."
+    return None
+
+
 def _scan_memory_content(content: str) -> Optional[str]:
-    """Scan memory content for injection/exfil patterns. Returns error string if blocked."""
-    return _first_threat_message(content, scope="strict")
+    """Validate entry syntax and scan injection/exfil patterns; return a blocking error."""
+    return _reserved_entry_error(content) or _first_threat_message(content, scope="strict")
 
 
 def _drift_error(path: "Path", bak_path: str) -> Dict[str, Any]:
@@ -231,8 +244,15 @@ class MemoryStore:
         mem_dir = get_memory_dir()
         mem_dir.mkdir(parents=True, exist_ok=True)
 
-        self.memory_entries = self._read_file(mem_dir / "MEMORY.md")
-        self.user_entries = self._read_file(mem_dir / "USER.md")
+        # Resolve pending native writes before any new frozen prompt consumes
+        # disk content. An unresolved third image must never enter that cache.
+        for target in ("memory", "user"):
+            with self._file_lock(self._path_for(target)):
+                raw, read_ok = self._read_raw_checked(self._path_for(target))
+                if not read_ok:
+                    raise RuntimeError("Native memory file unreadable during snapshot load")
+                self._native_snapshot(target, raw)
+                self._set_entries(target, self._parse_entries(raw))
 
         # Deduplicate entries (preserves order, keeps first occurrence)
         self.memory_entries = list(dict.fromkeys(self.memory_entries))
@@ -382,6 +402,9 @@ class MemoryStore:
         if not ok or raw != self._native_raw[target]:
             raise RuntimeError("Native memory changed before materialization")
         entries = self._entries_for(target)
+        serialized = ENTRY_DELIMITER.join(entries)
+        if self._parse_entries(serialized) != entries:
+            raise ValueError("Memory entries do not round-trip through the Markdown entry format")
         revision = uuid.uuid4().hex
         with self._native_db() as db:
             metadata = self._trusted_metadata(db)
@@ -398,7 +421,7 @@ class MemoryStore:
             if len(after) != len(entries):
                 raise RuntimeError("Native memory identity mismatch")
             record = {'id': revision, 'target': target, 'before_hash': self._hash(raw),
-                      'after_hash': self._hash(ENTRY_DELIMITER.join(entries)),
+                      'after_hash': self._hash(serialized),
                       'before': self._native_before[target], 'after': after, 'metadata': metadata}
             db.memory_prepare(record)
             # No success is returned until both file and provenance commit land.
@@ -462,9 +485,10 @@ class MemoryStore:
                     raise RuntimeError("Native memory journal recovery conflict; file unchanged")
             document = db.memory_document(target)
             old = json.loads(document['items_json']) if document else []
-            if document and document['content_hash'] == digest:
-                return old
             entries = self._parse_entries(raw)
+            if (document and document['content_hash'] == digest
+                    and [item['body'] for item in old] == entries):
+                return old
             observed = time.time()
             items = []
             for entry in entries:
@@ -504,6 +528,11 @@ class MemoryStore:
     def mutate_item(self, node_id, *, content=None, revert_revision=None):
         """Revision-bound journey edit/delete/revert through native scan/limits/lock."""
         parts = self._parse_node_id(node_id)
+        if content is not None:
+            content = _normalize_memory_text(content).strip()
+            error = _scan_memory_content(content)
+            if error:
+                raise ValueError(error)
         target = 'user' if parts[1] == 'profile' else 'memory'
         with self._file_lock(self._path_for(target)):
             bak = self._reload_target(target)
@@ -531,7 +560,7 @@ class MemoryStore:
                 entries.pop(idx)
                 self._native_order[target].pop(idx)
             else:
-                content = content.strip()
+                content = _normalize_memory_text(content).strip()
                 if not content:
                     raise ValueError("Empty memory; use delete to remove it")
                 error = _scan_memory_content(content)
@@ -569,7 +598,7 @@ class MemoryStore:
 
     def add(self, target: str, content: str) -> Dict[str, Any]:
         """Append a new entry. Returns error if it would exceed the char limit."""
-        content = content.strip()
+        content = _normalize_memory_text(content).strip()
         if not content:
             return {"success": False, "error": "Content cannot be empty."}
 
@@ -629,8 +658,8 @@ class MemoryStore:
 
     def replace(self, target: str, old_text: str, new_content: str) -> Dict[str, Any]:
         """Find entry containing old_text substring, replace it with new_content."""
-        old_text = old_text.strip()
-        new_content = new_content.strip()
+        old_text = _normalize_memory_text(old_text).strip()
+        new_content = _normalize_memory_text(new_content).strip()
         if not old_text:
             return {"success": False, "error": "old_text cannot be empty."}
         if not new_content:
@@ -700,7 +729,7 @@ class MemoryStore:
 
     def remove(self, target: str, old_text: str) -> Dict[str, Any]:
         """Remove the entry containing old_text substring."""
-        old_text = old_text.strip()
+        old_text = _normalize_memory_text(old_text).strip()
         if not old_text:
             return {"success": False, "error": "old_text cannot be empty."}
 
@@ -761,7 +790,7 @@ class MemoryStore:
         # disk -- a single poisoned op rejects the whole batch.
         for i, op in enumerate(operations):
             act = (op or {}).get("action")
-            new_content = (op or {}).get("content")
+            new_content = _normalize_memory_text((op or {}).get("content") or "")
             if act in {"add", "replace"} and new_content:
                 scan_error = _scan_memory_content(new_content)
                 if scan_error:
@@ -781,8 +810,8 @@ class MemoryStore:
             for i, op in enumerate(operations):
                 op = op or {}
                 act = op.get("action")
-                content = (op.get("content") or "").strip()
-                old_text = (op.get("old_text") or "").strip()
+                content = _normalize_memory_text(op.get("content") or "").strip()
+                old_text = _normalize_memory_text(op.get("old_text") or "").strip()
                 pos = f"Operation {i + 1} ({act or 'unknown'})"
 
                 if act == "add":
@@ -957,6 +986,7 @@ class MemoryStore:
     @staticmethod
     def _parse_entries(raw: str) -> List[str]:
         """Split raw memory-file text into stripped, non-empty entries."""
+        raw = _normalize_memory_text(raw)
         if not raw.strip():
             return []
         # Use ENTRY_DELIMITER for consistency with _write_file. Splitting by "§"
@@ -980,9 +1010,9 @@ class MemoryStore:
     def _read_file(path: Path) -> List[str]:
         """Read a memory file and split into entries (empty list on any error).
 
-        Retained for read-only callers (``load_from_disk``) that build in-memory
-        state without persisting; a failed read degrading to ``[]`` there is
-        harmless because nothing is written back. Read-modify-write paths use
+        Retained for read-only callers that inspect Markdown without building a
+        prompt snapshot or persisting. Snapshot loading checks reads and journal
+        recovery explicitly; it does not use this permissive helper. Read-modify-write paths use
         ``_read_raw_checked`` so they can refuse to overwrite an unreadable
         file — see ``_reload_target``.
         """
@@ -1023,13 +1053,14 @@ class MemoryStore:
         if not raw.strip():
             return None
 
-        parsed = [e.strip() for e in raw.split(ENTRY_DELIMITER) if e.strip()]
+        logical = _normalize_memory_text(raw)
+        parsed = self._parse_entries(logical)
         roundtrip = ENTRY_DELIMITER.join(parsed)
 
         char_limit = self._char_limit(target)
         max_entry_len = max((len(e) for e in parsed), default=0)
 
-        drift_detected = (raw.strip() != roundtrip) or (max_entry_len > char_limit)
+        drift_detected = (logical.strip() != roundtrip) or (max_entry_len > char_limit)
         if not drift_detected:
             return None
 
@@ -1039,7 +1070,7 @@ class MemoryStore:
         ts = int(time.time())
         bak_path = path.with_suffix(path.suffix + f".bak.{ts}")
         try:
-            bak_path.write_text(raw, encoding="utf-8")
+            bak_path.write_bytes(raw.encode("utf-8"))
         except (OSError, IOError):
             return str(bak_path) + " (BACKUP FAILED — file unchanged on disk)"
         return str(bak_path)
@@ -1060,8 +1091,8 @@ class MemoryStore:
                 dir=str(path.parent), suffix=".tmp", prefix=".mem_"
             )
             try:
-                with os.fdopen(fd, "w", encoding="utf-8") as f:
-                    f.write(content)
+                with os.fdopen(fd, "wb") as f:
+                    f.write(content.encode("utf-8"))
                     f.flush()
                     os.fsync(f.fileno())
                 resolved = atomic_replace(tmp_path, path)
@@ -1289,6 +1320,11 @@ def _memory_tool_impl(
     if operations:
         if not isinstance(operations, list):
             return tool_error("operations must be a list of {action, content?, old_text?} objects.", success=False)
+        for op in operations:
+            if (op or {}).get('action') in {'add', 'replace'}:
+                error = _reserved_entry_error((op or {}).get('content') or '')
+                if error:
+                    return tool_error(error, success=False)
         gate_result = _apply_batch_write_gate(target, operations)
         if gate_result is not None:
             return gate_result
@@ -1311,6 +1347,11 @@ def _memory_tool_impl(
         return tool_error(f"{missing} is required for 'replace' action.", success=False)
     if action == "remove" and not old_text:
         return _missing_old_text_error(store, target, "remove")
+
+    if action in {'add', 'replace'}:
+        error = _reserved_entry_error(content or '')
+        if error:
+            return tool_error(error, success=False)
 
     # Approval gate: when on, stages the write (background/gateway) or prompts
     # inline (interactive CLI); when off (default) passes straight through.

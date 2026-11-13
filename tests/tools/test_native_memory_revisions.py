@@ -305,3 +305,144 @@ def test_shared_store_keeps_memory_and_user_transactions_independent(store, monk
         assert memory.result()['success']
         assert user.result()['success']
     assert [c['body'] for c in cards()] == ['memory updated', 'user updated']
+
+
+@pytest.mark.req('native-memory/canonical-entry-content')
+@pytest.mark.parametrize('action', ['add', 'replace', 'batch_add', 'batch_replace', 'journey'])
+@pytest.mark.parametrize('invalid', ['alpha\n§\nbeta', 'alpha\r\n§\r\nbeta', 'alpha\n§', '§\nbeta'])
+def test_reserved_entry_separator_is_rejected_before_persistence(store, action, invalid):
+    store.add('memory', 'original')
+    before_card = cards()[0]
+    path = get_hermes_home() / 'memories' / 'MEMORY.md'
+    before_bytes = path.read_bytes()
+    db = SessionDB(get_hermes_home() / 'state.db')
+    before_journal = [tuple(row) for row in db._conn.execute('SELECT * FROM memory_write_journal')]
+    before_document = db.memory_document('memory')
+    db.close()
+    if action == 'journey':
+        result = edit_node(before_card['id'], invalid)
+        assert not result['ok']
+    elif action.startswith('batch_'):
+        operation = {'action': action.removeprefix('batch_'), 'content': invalid, 'old_text': 'original'}
+        assert not store.apply_batch('memory', [operation])['success']
+    elif action == 'replace':
+        assert not store.replace('memory', 'original', invalid)['success']
+    else:
+        assert not store.add('memory', invalid)['success']
+    assert path.read_bytes() == before_bytes
+    db = SessionDB(get_hermes_home() / 'state.db')
+    assert [tuple(row) for row in db._conn.execute('SELECT * FROM memory_write_journal')] == before_journal
+    assert db.memory_document('memory') == before_document
+    db.close()
+    assert store.add('memory', 'subsequent valid entry')['success']
+    assert len(cards()) == len(MemoryStore._read_file(path)) == 2
+    assert edit_node(before_card['id'], 'valid edit')['ok']
+
+
+@pytest.mark.req('native-memory/canonical-newline-materialization')
+def test_existing_crlf_entries_parse_logically_and_rewrite_as_exact_lf(store):
+    path = get_hermes_home() / 'memories' / 'MEMORY.md'
+    path.write_bytes(b'alpha\r\nline two\r\n\xc2\xa7\r\nbeta')
+    observed = cards()
+    assert [item['body'] for item in observed] == ['alpha\nline two', 'beta']
+    assert [item['timestamp'] for item in observed] == [None, None]
+    assert edit_node(observed[0]['id'], 'alpha edited')['ok']
+    assert path.read_bytes() == 'alpha edited\n§\nbeta'.encode('utf-8')
+    assert store.add('memory', 'later')['success']
+    assert len(cards()) == len(MemoryStore._read_file(path)) == 3
+
+
+@pytest.mark.req('native-memory/canonical-newline-materialization')
+def test_materialization_ignores_simulated_windows_text_translation(store, monkeypatch):
+    import os
+    original = os.fdopen
+    def windows_fdopen(fd, mode='r', *args, **kwargs):
+        if 'b' not in mode:
+            kwargs['newline'] = '\r\n'
+        return original(fd, mode, *args, **kwargs)
+    monkeypatch.setattr(os, 'fdopen', windows_fdopen)
+    assert store.add('memory', 'alpha\nline two')['success']
+    assert store.add('memory', 'beta')['success']
+    path = get_hermes_home() / 'memories' / 'MEMORY.md'
+    assert path.read_bytes() == 'alpha\nline two\n§\nbeta'.encode('utf-8')
+    assert len(cards()) == len(MemoryStore._read_file(path)) == 2
+
+
+@pytest.mark.req('native-memory/conflicting-external-content')
+def test_initial_prompt_snapshot_blocks_unresolved_third_image(store, monkeypatch):
+    store.add('memory', 'original')
+    store.load_from_disk()
+    old_snapshot = store.format_for_system_prompt('memory')
+    assert 'original' in old_snapshot
+    def conflict(path, entries):
+        path.write_bytes(b'conflicting external content')
+        raise RuntimeError('simulated interruption')
+    with monkeypatch.context() as patch:
+        patch.setattr(MemoryStore, '_write_file', staticmethod(conflict))
+        with pytest.raises(RuntimeError):
+            store.add('memory', 'proposed')
+    assert store.format_for_system_prompt('memory') == old_snapshot
+    fresh = MemoryStore()
+    with pytest.raises(RuntimeError, match='conflict'):
+        fresh.load_from_disk()
+    assert fresh.format_for_system_prompt('memory') is None
+
+
+@pytest.mark.req('native-memory/copyable-journey-handles')
+def test_redirected_cli_list_handle_is_copyable_into_history(store, monkeypatch, capsys):
+    import argparse
+    from hermes_cli.journey import register_cli
+    store.add('memory', 'a readable synthetic note')
+    expected = cards()[0]['id']
+    monkeypatch.setenv('COLUMNS', '80')
+    parser = argparse.ArgumentParser()
+    register_cli(parser)
+    args = parser.parse_args(['list', '--no-color'])
+    assert args.func(args) == 0
+    output = capsys.readouterr().out
+    line = next(line for line in output.splitlines() if line.startswith('memory:'))
+    copied_handle = line.split()[0]
+    assert copied_handle == expected
+    args = parser.parse_args(['history', copied_handle])
+    assert args.func(args) == 0
+    assert json.loads(capsys.readouterr().out)['content'] == 'a readable synthetic note'
+
+
+@pytest.mark.req('native-memory/failure-around-materialization')
+@pytest.mark.parametrize('phase', ['before', 'after'])
+def test_initial_loader_recovers_exact_crlf_before_or_lf_after_image(store, monkeypatch, phase):
+    path = get_hermes_home() / 'memories' / 'MEMORY.md'
+    original_bytes = 'first\r\n§\r\nsecond'.encode('utf-8')
+    path.write_bytes(original_bytes)
+    original = MemoryStore._write_file
+    def interrupt(path, entries):
+        if phase == 'after':
+            original(path, entries)
+        raise RuntimeError('simulated interruption')
+    with monkeypatch.context() as patch:
+        patch.setattr(MemoryStore, '_write_file', staticmethod(interrupt))
+        with pytest.raises(RuntimeError):
+            store.add('memory', 'third')
+    fresh = MemoryStore()
+    fresh.load_from_disk()
+    assert fresh.memory_entries == (['first', 'second', 'third'] if phase == 'after' else ['first', 'second'])
+    assert 'first' in fresh.format_for_system_prompt('memory')
+    if phase == 'before':
+        assert path.read_bytes() == original_bytes
+    db = SessionDB(get_hermes_home() / 'state.db')
+    assert db.memory_pending('memory') is None
+    db.close()
+    assert fresh.add('memory', 'subsequent')['success']
+
+
+@pytest.mark.req('native-memory/canonical-entry-content')
+@pytest.mark.parametrize('batch', [False, True])
+def test_reserved_entry_is_not_staged_for_approval(store, monkeypatch, batch):
+    from types import SimpleNamespace
+    from tools import write_approval as approval
+    monkeypatch.setattr(approval, 'evaluate_gate', lambda *a, **kw: SimpleNamespace(allow=False, blocked=False, message='stage'))
+    kwargs = {'operations': [{'action': 'add', 'content': 'alpha\n§\nbeta'}]} if batch else {'action': 'add', 'content': 'alpha\n§\nbeta'}
+    result = json.loads(memory_tool(store=store, **kwargs))
+    assert not result['success']
+    assert approval.list_pending('memory') == []
+    assert cards() == []

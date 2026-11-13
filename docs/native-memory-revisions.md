@@ -1,6 +1,11 @@
 # Native memory revisions
 
-Native `MEMORY.md` and `USER.md` remain §-delimited Markdown files. The existing
+Native `MEMORY.md` and `USER.md` remain §-delimited Markdown files. Standalone §
+lines are reserved separators; individual add/replace/batch/journey content that
+contains one is rejected before persistence. Submit separate entries instead.
+Logical parsing normalizes CRLF/CR to LF; recovery hashes retain exact raw bytes.
+Materialization writes deterministic UTF-8/LF bytes without platform text-mode
+newline translation. The existing
 profile `state.db` now records item identity, revisions, before/after images and
 causal metadata. Nothing changes the system-prompt memory snapshot after it has
 been loaded for a conversation.
@@ -32,7 +37,8 @@ prints a deletion receipt handle; pass that handle to `history` or `revert` to
 inspect or restore the deleted item. Restore appends the item and preserves all
 other current entries. Revert creates a new compensating revision; it never rolls
 back the whole file or silently replaces a newer revision of the same item.
-Refresh the list after an edit before making another change.
+Refresh the list after an edit before making another change. Handles are printed
+on complete, unwrapped lines, including when list output is redirected.
 
 ## Time and provenance
 
@@ -63,10 +69,11 @@ file writes fsync their data and, where supported, the rename's directory before
 provenance is committed. A failure never returns an acknowledged success with
 unresolved provenance.
 
-On the next native read/write, a pending prepare is resolved only when the exact
+Before loading a new frozen prompt snapshot, and on the next native read/write,
+a pending prepare is resolved only when the exact
 file hash matches its before or after image. Before means the unwritten prepare
 is aborted; after means the materialized change is committed. Any third image
-blocks reads/writes with a recovery conflict and leaves the file unchanged.
+blocks reads/writes and new prompt snapshots with a recovery conflict and leaves the file unchanged.
 The journal retains both images for inspection; there is no automatic conflict
 overwrite or data deletion. An unavailable journal prevents a native write.
 
@@ -88,6 +95,10 @@ retention or pruning policy is added for revision history.
 host contexts to cover stale handles, duplicate/manual observation, concurrent
 revision edits, profile-copy isolation, trusted foreground/background dispatch,
 pre/post-materialization failures, commit failure, exact-hash conflict blocking,
+reserved separator rejection, CRLF parsing and simulated Windows text translation,
 unavailable journaling, frozen prompts, compensating restore and real journey
 CLI dispatch. Nearby existing native memory, write-approval, session and cache
 regressions remain part of the focused check.
+
+Windows newline behavior is tested by simulated text translation on the local
+platform. This is not a claim of execution on a real Windows host.

@@ -247,7 +247,10 @@ def _cmd_list(args: argparse.Namespace) -> int:
     for node in nodes:
         glyph = "◆" if node.get("kind") == "memory" else "●"
         date = format_date(node.get("timestamp"))
-        console.print(f"[grey54]{node['id']}[/grey54]  {glyph} {node.get('label', '')}  [grey54]{date}[/grey54]")
+        # Identifiers are copy/paste inputs to history/edit/revert. Keep the
+        # whole handle on one line even in an 80-column terminal or pipe.
+        console.print(node['id'], style="grey54", soft_wrap=True, markup=False, highlight=False)
+        console.print(f"  {glyph} {node.get('label', '')}  [grey54]{date}[/grey54]")
     return 0
 
 

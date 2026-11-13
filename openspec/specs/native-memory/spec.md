@@ -32,6 +32,11 @@ This contract is a technical implementation slice, not full A78 completion.
 - **WHEN** a caller presents a handle from another or copied profile
 - **THEN** the native mutation fails without changing that profile's entries
 
+#### Scenario: Canonical entry content
+
+- **WHEN** add, replace, batch or journey content contains a standalone § line
+- **THEN** it is rejected before persistence, and subsequent valid writes remain usable
+
 ### Requirement: Honest native provenance
 
 New committed native writes SHALL record committed-write time separately from
@@ -88,6 +93,16 @@ This contract is a technical implementation slice, not full A78 completion.
 - **WHEN** the native journal cannot prepare a durable write
 - **THEN** no memory file change is made or acknowledged
 
+#### Scenario: Canonical newline materialization
+
+- **WHEN** existing CRLF files are loaded or platform text streams translate newlines
+- **THEN** logical entries parse consistently and materialization writes exact UTF-8/LF bytes while recovery hashes raw bytes
+
+#### Scenario: Snapshot recovery
+
+- **WHEN** a new conversation loads memory with a pending write
+- **THEN** exact before/after recovery completes under the native lock before snapshot capture, and a third image blocks capture
+
 ### Requirement: Compensating journey revert
 
 The existing journey CLI SHALL expose memory history and revision-bound revert.
@@ -110,3 +125,8 @@ This contract is a technical implementation slice, not full A78 completion.
 
 - **WHEN** native files and provenance change during a conversation
 - **THEN** the loaded system-prompt snapshot remains byte-identical
+
+#### Scenario: Copyable journey handles
+
+- **WHEN** journey list output is redirected at an 80-column width
+- **THEN** complete handles can be copied directly into history/edit/revert commands
