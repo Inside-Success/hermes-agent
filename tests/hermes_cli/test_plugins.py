@@ -623,6 +623,20 @@ class TestPluginLoading:
 class TestPluginHooks:
     """Tests for lifecycle hook registration and invocation."""
 
+    @pytest.mark.parametrize("event", ["pre_api_attempt", "post_api_attempt"])
+    def test_attempt_observer_registration_and_dispatch(self, tmp_path, monkeypatch, event):
+        plugins_dir = tmp_path / "hermes_test" / "plugins"
+        _make_plugin_dir(plugins_dir, "attempt_observer", register_body=(
+            f'ctx.register_hook("{event}", lambda **kw: {{"seen": kw["api_attempt_id"]}})'
+        ))
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes_test"))
+        mgr = PluginManager()
+        mgr.discover_and_load()
+        assert mgr.has_hook(event)
+        assert mgr.invoke_hook(event, api_attempt_id="turn:api:1:attempt:2") == [
+            {"seen": "turn:api:1:attempt:2"}
+        ]
+
     def test_valid_hooks_include_request_scoped_api_hooks(self):
         assert "pre_api_request" in VALID_HOOKS
         assert "post_api_request" in VALID_HOOKS

@@ -157,6 +157,10 @@ VALID_HOOKS: Set[str] = {
     "pre_api_request",
     "post_api_request",
     "api_request_error",
+    # Raw per-dispatch observers after execution middleware/preflight. Plugins
+    # must synchronously snapshot and redact payloads before retaining them.
+    "pre_api_attempt",
+    "post_api_attempt",
     "on_session_start",
     "on_session_end",
     "on_session_finalize",

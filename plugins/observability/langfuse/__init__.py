@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import re
 import threading
@@ -64,9 +65,174 @@ _TRACE_STATE: Dict[str, TraceState] = {}
 # to bound the leak from non-finalizing turns, not to limit concurrency.
 _MAX_TRACE_STATE = 256
 _LANGFUSE_CLIENT = None
+_FULL_CONTENT = False
 _READ_FILE_LINE_RE = re.compile(r"^\s*(\d+)\|(.*)$")
 _READ_FILE_HEAD_LINES = 25
 _READ_FILE_TAIL_LINES = 15
+
+# Credential syntax, not prose classification. Also catches opaque run tokens
+# embedded in instructions and JSON-encoded tool arguments.
+_SECRET_ASSIGNMENT_RE = re.compile(
+    r"(\b(?:[a-z0-9]+[_-])*(?:api[ _-]?key|secret[ _-]?key|access[ _-]?key(?:[ _-]?id)?|"
+    r"private[ _-]?key|run[ _-]?tokens?|access[ _-]?token|"
+    r"refresh[ _-]?token|token|secret|password|passwd|credential|authorization|cookie)"
+    r"\b[\"']?\s*[:=]\s*)(?:Bearer\s+|Basic\s+|Token\s+)?"
+    r'''("(?:\\.|[^"\\])*"|'[^']*'|[^\s,;"'}\]]+)''',
+    re.IGNORECASE,
+)
+
+
+def _sensitive_content_key(key: Any) -> bool:
+    # Accept standard snake/kebab/camel credential names without classifying
+    # token counts, usage buckets, or arbitrary fields containing "key".
+    name = re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", str(key)).casefold().replace("-", "_")
+    return name in {
+        "api_key", "apikey", "authorization", "proxy_authorization", "cookie", "set_cookie",
+        "password", "passwd", "secret", "token", "run_tokens", "private_key",
+        "credential", "credentials", "auth", "bearer", "secret_value", "raw_secret",
+        "secret_input", "key_material", "secret_key", "access_key", "access_key_id",
+    } or name.endswith(("_api_key", "_token", "_secret", "_password", "_passwd", "_credential",
+                         "_credentials", "_private_key", "_secret_key", "_access_key", "_access_key_id"))
+
+
+_SCHEMA_ROOT_KEYS = {"parameters", "input_schema", "json_schema", "schema"}
+_SCHEMA_MAP_KEYS = {"properties", "patternProperties", "$defs", "definitions", "dependentSchemas",
+                    "dependencies", "dependentRequired"}
+_SCHEMA_NODE_KEYS = {"items", "additionalItems", "additionalProperties", "unevaluatedItems",
+                     "unevaluatedProperties", "contains", "not", "if", "then", "else", "propertyNames",
+                     "anyOf", "oneOf", "allOf", "prefixItems"}
+_SCHEMA_MARKERS = {"type", "$ref", "$dynamicRef"} | _SCHEMA_MAP_KEYS | _SCHEMA_NODE_KEYS
+_SCHEMA_VALUE_KEYS = {"default", "const", "enum", "examples", "example"}
+
+
+def _full_value(value: Any) -> Any:
+    """Copy complete JSON model source content, redacting credentials first.
+
+    There are no message/string/container/depth preview limits. Non-JSON types
+    have explicit representations; cycles/unsupported types are marked, never
+    silently presented as complete content. This does not inspect HTTP wire
+    bytes or recover reasoning a provider did not expose.
+    """
+    from agent.redact import redact_sensitive_text
+
+    secrets = sorted({v for k, v in os.environ.items()
+                      if v and _sensitive_content_key(k)}, key=len, reverse=True)
+    active: set[int] = set()
+
+    def text_value(text: str) -> str:
+        # Tool arguments/results can themselves contain JSON strings, including
+        # further JSON-encoded strings. Preserve original bytes when unchanged;
+        # parse recursively only to remove credential fields at every level.
+        if text.lstrip().startswith(("{", "[", '"')):
+            try:
+                parsed = json.loads(text)
+            except (ValueError, TypeError):
+                pass
+            else:
+                cleaned = copy(parsed)
+                if cleaned != parsed:
+                    return json.dumps(cleaned, ensure_ascii=False)
+        for secret in secrets:
+            text = text.replace(secret, "[REDACTED]")
+        text = _SECRET_ASSIGNMENT_RE.sub(
+            lambda m: m.group(1) + ('"[REDACTED]"' if m.group(2).startswith('"')
+                                    else "[REDACTED]"), text,
+        )
+        return redact_sensitive_text(text, force=True, redact_url_credentials=True)
+
+    def copy(item: Any, *, schema: bool = False, schema_map: bool = False,
+             credential_schema: bool = False) -> Any:
+        if item is None or isinstance(item, (bool, int)):
+            return item
+        if isinstance(item, float):
+            return item if math.isfinite(item) else {"type": "float", "value": str(item)}
+        if isinstance(item, str):
+            return text_value(item)
+        if isinstance(item, (bytes, bytearray)):
+            # Binary data can encode credentials in arbitrary forms, so neither
+            # text redaction nor a base64 wrapper makes it safe to export.
+            return {"type": "bytes", "omitted": True,
+                    "reason": "opaque binary may contain credentials", "length": len(item)}
+        ident = id(item)
+        if ident in active:
+            return {"omitted": True, "reason": "cyclic non-JSON value", "type": type(item).__name__}
+        active.add(ident)
+        try:
+            if isinstance(item, dict):
+                # JSON Schema property names describe future values; they are
+                # part of the tool contract. Their defaults/examples are DATA,
+                # so a schema context must never exempt them from redaction.
+                result = {}
+                # A Python mapping key can be bytes, a tuple containing bytes,
+                # or an arbitrary object's repr. Never stringify those keys:
+                # doing so can disclose both the key and its sensitive value.
+                # Reserve the cleaned text keys so omission markers cannot
+                # overwrite even a later literal key with the same name.
+                reserved = {text_value(key) for key in item if isinstance(key, str)}
+
+                def unique_key(base: str) -> str:
+                    name = base
+                    suffix = 1
+                    while name in result or (name != base and name in reserved):
+                        name = f"{base} [{suffix}]"
+                        suffix += 1
+                    return name
+
+                for key, val in item.items():
+                    if not isinstance(key, str):
+                        base = "[omitted non-string key]"
+                        safe_key = base
+                        suffix = 1
+                        while safe_key in reserved or safe_key in result:
+                            safe_key = f"{base} [{suffix}]"
+                            suffix += 1
+                        result[safe_key] = "[OMITTED: non-string mapping key]"
+                        continue
+                    safe_key = unique_key(text_value(key))
+                    if schema_map:
+                        safe_val = copy(val, schema=True, credential_schema=_sensitive_content_key(key))
+                    elif schema:
+                        if key in _SCHEMA_VALUE_KEYS:
+                            safe_val = "[REDACTED]" if credential_schema else copy(val)
+                        elif key in _SCHEMA_MAP_KEYS:
+                            safe_val = copy(val, schema_map=True)
+                        elif key in _SCHEMA_NODE_KEYS:
+                            safe_val = copy(val, schema=True, credential_schema=credential_schema)
+                        elif _sensitive_content_key(key):
+                            safe_val = "[REDACTED]"
+                        else:
+                            safe_val = copy(val)
+                    elif _sensitive_content_key(key):
+                        safe_val = "[REDACTED]"
+                    else:
+                        is_schema = key in _SCHEMA_ROOT_KEYS and isinstance(val, dict) and bool(_SCHEMA_MARKERS & val.keys())
+                        safe_val = copy(val, schema=is_schema)
+                    result[safe_key] = safe_val
+                return result
+            if isinstance(item, (list, tuple, set)):
+                return [copy(v, schema=schema, credential_schema=credential_schema) for v in item]
+            if isinstance(item, BaseException):
+                if all(isinstance(arg, (str, int, float, bool, type(None))) for arg in item.args):
+                    return {"type": type(item).__name__, "message": text_value(str(item))}
+                # Exception repr embeds arbitrary arguments (including bytes).
+                return {"type": type(item).__name__, "arguments": copy(item.args)}
+            if callable(getattr(item, "model_dump", None)):
+                return copy(item.model_dump(mode="python"))
+            if hasattr(item, "__dict__"):
+                return copy(vars(item))
+            return {"omitted": True, "reason": "unsupported non-JSON value", "type": type(item).__name__}
+        finally:
+            active.remove(ident)
+
+    return copy(value)
+
+
+def _content_value(value: Any, **preview_kwargs: Any) -> Any:
+    return _full_value(value) if _FULL_CONTENT else _safe_value(value, **preview_kwargs)
+
+
+def _metadata_value(value: Any) -> Any:
+    return _safe_value(_full_value(value)) if _FULL_CONTENT else value
 
 # Langfuse-issued keys always carry these prefixes (cloud or self-hosted —
 # the prefix is baked into the server-side issuance flow, not a UI hint).
@@ -462,7 +628,7 @@ def _extract_last_user_message(messages: Any) -> Any:
         if isinstance(message, dict) and message.get("role") == "user":
             return {
                 "role": "user",
-                "content": _safe_value(message.get("content")),
+                "content": _content_value(message.get("content")),
             }
     return None
 
@@ -616,9 +782,12 @@ def _start_root_trace(task_key: str, *, task_id: str, session_id: str, platform:
         "model": model,
         "api_mode": api_mode,
     }
+    if _FULL_CONTENT:
+        metadata.update(full_content=True, captured_scope="hermes_dispatch_attempt", redacted=True)
+        metadata = _metadata_value(metadata)
 
     if model_selection is not None:
-        metadata["model_selection"] = _safe_value(model_selection)
+        metadata["model_selection"] = _metadata_value(model_selection) if _FULL_CONTENT else _safe_value(model_selection)
 
     # session_id must be passed in trace_context for Langfuse session grouping.
     trace_ctx: Dict[str, Any] = {"trace_id": trace_id}
@@ -678,9 +847,9 @@ def _start_child_observation(state: TraceState, *, client: Langfuse, name: str, 
         name=name,
         as_type=as_type,
         input=input_value,
-        metadata=metadata or {},
-        model=model,
-        model_parameters=model_parameters,
+        metadata=_metadata_value(metadata or {}),
+        model=_content_value(model) if _FULL_CONTENT else model,
+        model_parameters=_metadata_value(model_parameters),
     )
 
 
@@ -783,6 +952,8 @@ def on_pre_llm_call(*, task_id: str = "", session_id: str = "", platform: str = 
                     api_call_count: int = 0, messages: Any = None, turn_type: str = "user",
                     conversation_history: Any = None, user_message: Any = None,
                     turn_id: str = "", api_request_id: str = "", **_: Any) -> None:
+    if _FULL_CONTENT:
+        return
     # Older Hermes branches used pre_llm_call for request-scoped tracing and
     # passed the actual API messages. Current Hermes also has a turn-scoped
     # pre_llm_call used for context injection; tracing that hook creates an
@@ -852,6 +1023,8 @@ def on_pre_llm_request(
     model_selection: Optional[dict] = None,
     **_: Any,
 ) -> None:
+    if _FULL_CONTENT:
+        return
     client = _get_langfuse()
     if client is None:
         return
@@ -913,6 +1086,73 @@ def on_pre_llm_request(
         )
 
 
+def on_pre_api_attempt(*, request: Any = None, api_attempt_id: str = "",
+                       task_id: str = "", session_id: str = "", turn_id: str = "",
+                       api_request_id: str = "", api_call_count: int = 0,
+                       platform: str = "", provider: str = "", model: str = "",
+                       api_mode: str = "", base_url: str = "",
+                       model_selection: Optional[dict] = None, **_: Any) -> None:
+    """Capture the synchronous snapshot before this Hermes dispatch attempt."""
+    if not _FULL_CONTENT:
+        return
+    client = _get_langfuse()
+    if client is None:
+        return
+    # Snapshot before returning to the retry machinery; kwargs can be mutated.
+    source = _full_value(request)
+    messages = source.get("messages", source.get("input", [])) if isinstance(source, dict) else []
+    task_key = _trace_key(task_id, session_id, turn_id=turn_id, api_request_id=api_request_id)
+    metadata = _metadata_value({
+        "full_content": True, "captured_scope": "hermes_dispatch_attempt", "redacted": True,
+        "api_attempt_id": api_attempt_id, "api_request_id": api_request_id,
+        "provider": provider, "platform": platform, "api_mode": api_mode, "base_url": base_url,
+        "available_message_count": len(messages) if isinstance(messages, list) else None,
+        **({"model_selection": model_selection} if model_selection is not None else {}),
+    })
+    with _STATE_LOCK:
+        state = _TRACE_STATE.get(task_key)
+        if state is None:
+            state = _start_root_trace(
+                task_key, task_id=task_id, session_id=session_id, platform=platform,
+                provider=provider, model=model, api_mode=api_mode, messages=messages,
+                client=client, turn_id=turn_id, api_request_id=api_request_id,
+                model_selection=model_selection,
+            )
+            _evict_stale_locked()
+            _TRACE_STATE[task_key] = state
+        state.last_updated_at = time.time()
+        state.generations[api_attempt_id] = _start_child_observation(
+            state, client=client, name=f"LLM attempt {api_attempt_id}", as_type="generation",
+            input_value=source, metadata=metadata, model=model,
+            model_parameters={"api_mode": api_mode, "provider": provider},
+        )
+
+
+def on_post_api_attempt(*, response: Any = None, error: Any = None, partial: Any = None,
+                        api_attempt_id: str = "", task_id: str = "", session_id: str = "",
+                        turn_id: str = "", api_request_id: str = "", provider: str = "",
+                        model: str = "", api_mode: str = "", base_url: str = "",
+                        duration: float = 0.0, **_: Any) -> None:
+    if not _FULL_CONTENT:
+        return
+    task_key = _trace_key(task_id, session_id, turn_id=turn_id, api_request_id=api_request_id)
+    with _STATE_LOCK:
+        state = _TRACE_STATE.get(task_key)
+        generation = state.generations.pop(api_attempt_id, None) if state else None
+    if generation is None:
+        return
+    output = {"error": _full_value(error), "partial": _full_value(partial)} if error is not None else _full_value(response)
+    usage_details, cost_details = _usage_and_cost(
+        response, provider=provider, api_mode=api_mode, model=model, base_url=base_url,
+    )
+    _end_observation(
+        generation, output=output, usage_details=usage_details, cost_details=cost_details,
+        metadata=_metadata_value({"api_attempt_id": api_attempt_id, "status": "error" if error else "success",
+                                  "duration_s": duration, "full_content": True,
+                                  "captured_scope": "hermes_dispatch_attempt", "redacted": True}),
+    )
+
+
 def on_post_llm_call(*, task_id: str = "", session_id: str = "", provider: str = "", base_url: str = "",
                      api_mode: str = "", model: str = "", api_call_count: int = 0,
                      assistant_message: Any = None, response: Any = None,
@@ -921,6 +1161,13 @@ def on_post_llm_call(*, task_id: str = "", session_id: str = "", provider: str =
                      assistant_tool_call_count: int = 0, assistant_response: Any = None,
                      turn_id: str = "", api_request_id: str = "",
                      **_: Any) -> None:
+    if _FULL_CONTENT:
+        # post_api_request carries api_request_id; only the later turn hook
+        # closes the chain. It must not consume an in-flight attempt span.
+        if not api_request_id:
+            output = assistant_message if assistant_message is not None else assistant_response
+            _finish_trace(_trace_key(task_id, session_id, turn_id=turn_id), output=_full_value(output))
+        return
     client = _get_langfuse()
     if client is None:
         return
@@ -1070,7 +1317,7 @@ def on_pre_tool_call(*, tool_name: str = "", args: Any = None, task_id: str = ""
             client=client,
             name=f"Tool: {tool_name}",
             as_type="tool",
-            input_value=_safe_value(args),
+            input_value=_content_value(args),
             metadata={"tool_name": tool_name, "tool_call_id": tool_call_id},
         )
         if tool_call_id:
@@ -1106,12 +1353,15 @@ def on_post_tool_call(*, tool_name: str = "", args: Any = None, result: Any = No
     if observation is None:
         return
 
-    if isinstance(result, str):
+    if _FULL_CONTENT:
+        safe_result_value = _full_value(result)
+    elif isinstance(result, str):
         result_value = _maybe_parse_json_string(result)
     else:
         result_value = result
-    result_value = _normalize_payload(result_value, tool_name=tool_name, args=args)
-    safe_result_value = _safe_value(result_value, parse_json_strings=True)
+    if not _FULL_CONTENT:
+        result_value = _normalize_payload(result_value, tool_name=tool_name, args=args)
+        safe_result_value = _safe_value(result_value, parse_json_strings=True)
 
     # Backfill so the generation's tool_call record carries the result alongside arguments.
     if tool_call_id:
@@ -1129,16 +1379,26 @@ def on_post_tool_call(*, tool_name: str = "", args: Any = None, result: Any = No
     _end_observation(
         observation,
         output=safe_result_value,
-        metadata={"tool_name": tool_name, "args": _safe_value(args, parse_json_strings=True)},
+        metadata=_metadata_value({"tool_name": tool_name, "args": _content_value(args, parse_json_strings=True)}),
     )
 
 
 def register(ctx) -> None:
+    global _FULL_CONTENT
+    # Load once at plugin registration; never re-read config per hook.
+    try:
+        from hermes_cli.config import load_config
+        entries = ((load_config() or {}).get("plugins") or {}).get("entries") or {}
+        _FULL_CONTENT = (entries.get("observability/langfuse") or {}).get("full_content", False) is True
+    except Exception:
+        _FULL_CONTENT = False
     # Register for both hook name variants so the plugin works across
     # Hermes versions.  pre_api_request / post_api_request fire per API
     # call (preferred); pre_llm_call / post_llm_call fire once per turn.
     ctx.register_hook("pre_api_request", on_pre_llm_request)
     ctx.register_hook("post_api_request", on_post_llm_call)
+    ctx.register_hook("pre_api_attempt", on_pre_api_attempt)
+    ctx.register_hook("post_api_attempt", on_post_api_attempt)
     ctx.register_hook("pre_llm_call", on_pre_llm_call)
     ctx.register_hook("post_llm_call", on_post_llm_call)
     ctx.register_hook("pre_tool_call", on_pre_tool_call)

@@ -37,6 +37,71 @@ def _make_agent(**kwargs):
 class TestStreamInterruptBeforeRetry:
     """Verify _interrupt_requested is checked before each streaming retry."""
 
+    @patch("run_agent.AIAgent._create_request_anthropic_client")
+    @patch("run_agent.AIAgent._close_request_anthropic_client")
+    def test_anthropic_interrupt_reports_error_and_partial_content(self, mock_close, mock_create):
+        agent = _make_agent()
+        agent.api_mode = "anthropic_messages"
+        agent._interrupt_requested = False
+        agent._fire_stream_delta = lambda text: None
+        events = []
+
+        def stream_events():
+            yield SimpleNamespace(type="content_block_delta",
+                                  delta=SimpleNamespace(type="text_delta", text="partial"))
+            agent._interrupt_requested = True
+            yield SimpleNamespace(type="content_block_delta",
+                                  delta=SimpleNamespace(type="text_delta", text="ignored"))
+
+        stream = MagicMock()
+        stream.__enter__.return_value = stream
+        stream.__iter__.side_effect = stream_events
+        mock_create.return_value.messages.stream.return_value = stream
+        with pytest.raises(InterruptedError):
+            agent._interruptible_streaming_api_call(
+                {}, attempt_observer=lambda event, **data: events.append((event, data)))
+        assert [event for event, _ in events] == ["pre", "post"]
+        assert isinstance(events[1][1]["error"], InterruptedError)
+        assert events[1][1]["partial"]["content"] == "partial"
+
+    @patch("run_agent.AIAgent._create_request_anthropic_client")
+    @patch("run_agent.AIAgent._close_request_anthropic_client")
+    def test_interrupt_during_client_creation_does_not_dispatch_late(self, mock_close, mock_create):
+        import threading
+        agent = _make_agent()
+        agent.api_mode = "anthropic_messages"
+        agent._interrupt_requested = False
+        entered = threading.Event()
+        release = threading.Event()
+        events = []
+        client = MagicMock()
+
+        def blocked_client(**kwargs):
+            entered.set()
+            assert release.wait(5)
+            return client
+
+        mock_create.side_effect = blocked_client
+        def interrupt():
+            assert entered.wait(5)
+            agent._interrupt_requested = True
+        interrupter = threading.Thread(target=interrupt)
+        interrupter.start()
+        try:
+            with pytest.raises(InterruptedError):
+                agent._interruptible_streaming_api_call(
+                    {}, attempt_observer=lambda event, **data: events.append((event, data)))
+        finally:
+            release.set()
+            interrupter.join(timeout=5)
+        # Worker cleanup is asynchronous; wait for its client close callback.
+        import time
+        deadline = time.monotonic() + 3
+        while not mock_close.called and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert not events
+        client.messages.stream.assert_not_called()
+
     @pytest.mark.filterwarnings(
         "ignore::pytest.PytestUnhandledThreadExceptionWarning"
     )

@@ -1866,18 +1866,20 @@ class AIAgent:
         self,
         messages: List[Dict],
         conversation_history: Optional[List[Dict]] = None,
+        tool_content_overrides: Optional[Dict[str, str]] = None,
     ):
         """Serialize direct and turn-boundary session flushes per agent."""
         persist_lock = getattr(self, "_session_persist_lock", None)
         if persist_lock is None:
-            return self._flush_messages_to_session_db_unlocked(messages, conversation_history)
+            return self._flush_messages_to_session_db_unlocked(messages, conversation_history, tool_content_overrides)
         with persist_lock:
-            return self._flush_messages_to_session_db_unlocked(messages, conversation_history)
+            return self._flush_messages_to_session_db_unlocked(messages, conversation_history, tool_content_overrides)
 
     def _flush_messages_to_session_db_unlocked(
         self,
         messages: List[Dict],
         conversation_history: Optional[List[Dict]] = None,
+        tool_content_overrides: Optional[Dict[str, str]] = None,
     ):
         """Persist any un-flushed messages to the SQLite session store.
 
@@ -1990,6 +1992,18 @@ class AIAgent:
                 _row_api_content = msg.get("api_content")
                 if not isinstance(_row_api_content, str):
                     _row_api_content = None
+                # Per-result spilling happens before the progress flush.
+                # Preserve its original evidence in content and the model's
+                # transformed view in the existing sidecar, without mutating
+                # the live message or losing its persistence identity marker.
+                if (
+                    role == "tool"
+                    and tool_content_overrides
+                    and msg.get("tool_call_id") in tool_content_overrides
+                    and isinstance(content, str)
+                ):
+                    _row_api_content = content
+                    content = tool_content_overrides[msg["tool_call_id"]]
                 _row_timestamp = msg.get("timestamp")
                 # Apply the persist override to THIS row's written values only
                 # (never to the live dict). A multimodal override is a complete
@@ -5562,11 +5576,12 @@ class AIAgent:
         )
 
     def _interruptible_streaming_api_call(
-        self, api_kwargs: dict, *, on_first_delta: callable = None
+        self, api_kwargs: dict, *, on_first_delta: callable = None, attempt_observer=None
     ):
         """Forwarder — see ``agent.chat_completion_helpers.interruptible_streaming_api_call``."""
         from agent.chat_completion_helpers import interruptible_streaming_api_call
-        return interruptible_streaming_api_call(self, api_kwargs, on_first_delta=on_first_delta)
+        return interruptible_streaming_api_call(self, api_kwargs, on_first_delta=on_first_delta,
+                                                attempt_observer=attempt_observer)
 
     def _try_activate_fallback(self, reason: "FailoverReason | None" = None) -> bool:
         """Forwarder — see ``agent.chat_completion_helpers.try_activate_fallback``."""
