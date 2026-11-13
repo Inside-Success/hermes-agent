@@ -3065,6 +3065,10 @@ DEFAULT_CONFIG = {
 
     # Gateway settings — control how messaging platforms (Telegram, Discord,
     # Slack, etc.) deliver agent-produced files as native attachments.
+    # Optional validated model policy for unrestricted gateway turns only.
+    # None preserves session model resolution. See docs/turn-model-selection.md.
+    "turn_model_selection": None,
+
     "gateway": {
         # Durable delivery-obligation ledger: final agent responses are
         # recorded in state.db around the platform send, and a gateway that

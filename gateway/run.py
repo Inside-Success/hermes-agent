@@ -4525,15 +4525,21 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         return model, runtime_kwargs
 
-    def _resolve_turn_agent_config(self, user_message: str, model: str, runtime_kwargs: dict) -> dict:
-        """Build the effective model/runtime config for a single turn.
+    def _resolve_turn_agent_config(self, user_message: str, model: str, runtime_kwargs: dict,
+                                   *, user_config: Optional[dict] = None,
+                                   service_tier: Optional[str] = None) -> dict:
+        """Select a validated turn model before caching and request settings.
 
-        Always uses the session's primary model/provider.  If `/fast` is
-        enabled and the model supports Priority Processing / Anthropic fast
-        mode, attach `request_overrides` so the API call is marked
-        accordingly.
+        Prompt text never establishes a trusted bounded operation. The gateway
+        supplies unrestricted_turn only; credentials stay provider-scoped.
         """
         from hermes_cli.models import resolve_fast_mode_overrides
+        from gateway.turn_model_selection import select_turn_model
+
+        model, decision = select_turn_model(
+            (user_config or {}).get("turn_model_selection"), model,
+            runtime_kwargs.get("provider"),
+        )
 
         runtime = {
             "api_key": runtime_kwargs.get("api_key"),
@@ -4549,6 +4555,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         route = {
             "model": model,
             "runtime": runtime,
+            "model_selection": decision,
             "signature": (
                 model,
                 runtime["provider"],
@@ -4560,7 +4567,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             ),
         }
 
-        service_tier = getattr(self, "_service_tier", None)
+        if service_tier is None and user_config is None:
+            service_tier = getattr(self, "_service_tier", None)
         if not service_tier:
             route["request_overrides"] = {}
             return route
@@ -15792,12 +15800,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
             pr = self._provider_routing
             max_iterations = _current_max_iterations()
-            reasoning_config = self._resolve_session_reasoning_config(
-                source=source, model=model
+            service_tier = self._resolve_session_service_tier(source=source)
+            turn_route = self._resolve_turn_agent_config(
+                prompt, model, runtime_kwargs, user_config=user_config, service_tier=service_tier,
             )
-            self._reasoning_config = reasoning_config
-            self._service_tier = self._resolve_session_service_tier(source=source)
-            turn_route = self._resolve_turn_agent_config(prompt, model, runtime_kwargs)
+            reasoning_config = self._resolve_session_reasoning_config(
+                source=source, model=turn_route["model"]
+            )
 
             # Enrich the prompt with image descriptions so the background
             # agent can see user-attached images (same as the main flow).
@@ -15827,7 +15836,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     enabled_toolsets=enabled_toolsets,
                     disabled_toolsets=disabled_toolsets,
                     reasoning_config=reasoning_config,
-                    service_tier=self._service_tier,
+                    service_tier=service_tier,
                     request_overrides=turn_route.get("request_overrides"),
                     providers_allowed=pr.get("only"),
                     providers_ignored=pr.get("ignore"),
@@ -15848,6 +15857,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     # Reload from disk — do not reuse the startup snapshot (#60955).
                     fallback_model=self._refresh_fallback_model(),
                 )
+                agent.turn_model_selection = turn_route.get("model_selection")
                 try:
                     return agent.run_conversation(
                         user_message=enriched_prompt,
@@ -21289,14 +21299,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 }
 
             pr = self._provider_routing
+            service_tier = self._resolve_session_service_tier(
+                source=source, session_key=session_key
+            )
+            turn_route = self._resolve_turn_agent_config(
+                message, model, runtime_kwargs, user_config=user_config, service_tier=service_tier,
+            )
             reasoning_config = self._resolve_session_reasoning_config(
                 source=source,
                 session_key=session_key,
-                model=model,
-            )
-            self._reasoning_config = reasoning_config
-            self._service_tier = self._resolve_session_service_tier(
-                source=source, session_key=session_key
+                model=turn_route["model"],
             )
             # Set up stream consumer for token streaming or interim commentary.
             _stream_consumer = None
@@ -21412,8 +21424,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     log_message="interim_assistant_callback scheduling error",
                 )
 
-            turn_route = self._resolve_turn_agent_config(message, model, runtime_kwargs)
-
             # Check agent cache — reuse the AIAgent from the previous message
             # in this session to preserve the frozen system prompt and tool
             # schemas for prompt cache hits.
@@ -21484,7 +21494,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if _cache_lock and _cache is not None:
                 with _cache_lock:
                     cached = _cache.get(session_key)
-                    if cached and cached[1] == _sig:
+                    if (cached and cached[1] == _sig and (
+                        (turn_route.get("model_selection") or {}).get("status") != "selected" or (
+                            getattr(cached[0], "model", None) == turn_route["model"]
+                            and getattr(cached[0], "provider", None) == turn_route["runtime"].get("provider")
+                        )
+                    )):
+                        # A prior fallback may have changed the actual agent
+                        # while its cached signature still names the primary.
+                        # An explicit turn policy must select afresh next turn.
                         # cached[2] is the message_count at cache time;
                         # stale when a second process appended rows.
                         # cached[3] (when present) is the session_id the
@@ -21639,7 +21657,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     ephemeral_system_prompt=combined_ephemeral or None,
                     prefill_messages=self._prefill_messages or None,
                     reasoning_config=reasoning_config,
-                    service_tier=self._service_tier,
+                    service_tier=service_tier,
                     request_overrides=turn_route.get("request_overrides"),
                     providers_allowed=pr.get("only"),
                     providers_ignored=pr.get("ignore"),
@@ -21735,7 +21753,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             agent.notice_clear_callback = None
             agent.event_callback = _event_callback_sync
             agent.reasoning_config = reasoning_config
-            agent.service_tier = self._service_tier
+            agent.service_tier = service_tier
+            agent.turn_model_selection = turn_route.get("model_selection")
             agent.request_overrides = turn_route.get("request_overrides") or {}
             # Must-deliver notes for THIS turn ride the current user message
             # (api_content sidecar), never the system prompt: staged by

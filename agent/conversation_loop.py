@@ -1938,6 +1938,17 @@ def run_conversation(
                         # provider client.  New consumers should read the
                         # sanitised view from ``request["body"]["messages"]``.
                         _request_payload = agent._api_request_payload_for_hook(api_kwargs)
+                        _reasoning_keys = ("reasoning", "reasoning_effort", "thinking")
+                        _request_reasoning = {
+                            key: api_kwargs[key] for key in _reasoning_keys if key in api_kwargs
+                        }
+                        _extra_body = api_kwargs.get("extra_body")
+                        if isinstance(_extra_body, dict):
+                            _extra_reasoning = {
+                                key: _extra_body[key] for key in _reasoning_keys if key in _extra_body
+                            }
+                            if _extra_reasoning:
+                                _request_reasoning["extra_body"] = _extra_reasoning
                         _invoke_hook(
                             "pre_api_request",
                             task_id=effective_task_id,
@@ -1947,7 +1958,7 @@ def run_conversation(
                             user_message=original_user_message,
                             conversation_history=list(messages),
                             platform=agent.platform or "",
-                            model=agent.model,
+                            model=api_kwargs.get("model", agent.model),
                             provider=agent.provider,
                             base_url=agent.base_url,
                             api_mode=agent.api_mode,
@@ -1963,6 +1974,16 @@ def run_conversation(
                             started_at=api_start_time,
                             middleware_trace=list(_llm_middleware_trace),
                             request=_request_payload,
+                            model_selection=(
+                                {
+                                    **agent.turn_model_selection,
+                                    "effective_model": api_kwargs.get("model", agent.model),
+                                    "effective_provider": agent.provider,
+                                    "effective_reasoning": _request_reasoning,
+                                    "effective_service_tier": api_kwargs.get("service_tier"),
+                                }
+                                if getattr(agent, "turn_model_selection", None) else None
+                            ),
                         )
                 except Exception:
                     pass

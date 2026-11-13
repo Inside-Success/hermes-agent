@@ -4364,6 +4364,11 @@ class TestRunConversation:
 
     def test_request_scoped_api_hooks_fire_for_each_api_call(self, agent):
         self._setup_agent(agent)
+        agent.turn_model_selection = {
+            "status": "selected", "policy_revision": "test-v1", "reason": "quality",
+            "operation": "unrestricted_turn", "operation_provenance": "gateway",
+            "selected_model": agent.model, "selected_provider": agent.provider,
+        }
         tc = _mock_tool_call(name="web_search", arguments="{}", call_id="c1")
         resp1 = _mock_response(content="", finish_reason="tool_calls", tool_calls=[tc])
         resp2 = _mock_response(content="Done searching", finish_reason="stop")
@@ -4405,6 +4410,25 @@ class TestRunConversation:
         assert any(msg.get("role") == "user" and msg.get("content") == "search something" for msg in pre_request_calls[0]["request_messages"])
         assert all("usage" in c and "response" in c for c in post_request_calls)
         assert all("assistant_message" in c["response"] for c in post_request_calls)
+        for call in pre_request_calls:
+            receipt = call["model_selection"]
+            body = call["request"]["body"]
+            assert receipt["selected_model"] == agent.turn_model_selection["selected_model"]
+            assert receipt["effective_model"] == call["model"] == body["model"]
+            assert receipt["effective_provider"] == call["provider"]
+            assert receipt["effective_service_tier"] == body.get("service_tier")
+            expected_reasoning = {
+                key: body[key] for key in ("reasoning", "reasoning_effort", "thinking")
+                if key in body
+            }
+            extra_reasoning = {
+                key: body.get("extra_body", {})[key]
+                for key in ("reasoning", "reasoning_effort", "thinking")
+                if key in body.get("extra_body", {})
+            }
+            if extra_reasoning:
+                expected_reasoning["extra_body"] = extra_reasoning
+            assert receipt["effective_reasoning"] == expected_reasoning
 
     def test_api_request_error_hook_skips_payload_work_without_listener(self, agent, monkeypatch):
         payload_built = False
