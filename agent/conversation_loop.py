@@ -2098,7 +2098,7 @@ def run_conversation(
                         except Exception:
                             logger.debug("Model attempt observer failed", exc_info=True)
 
-                    stream_observed = {"started": False}
+                    stream_observed = {"started": False, "closed": False}
                     stream_lock = threading.Lock()
                     stream_open = {}
 
@@ -2106,6 +2106,8 @@ def run_conversation(
                         context = dict(attempt_context)
                         context["api_attempt_id"] = f"{attempt_context['api_attempt_id']}:stream:{number}"
                         with stream_lock:
+                            if stream_observed["closed"]:
+                                return
                             if event == "pre":
                                 stream_observed["started"] = True
                                 context["request"] = request
@@ -2118,6 +2120,9 @@ def run_conversation(
 
                     def close_unfinished_streams(error):
                         with stream_lock:
+                            # Worker threads can unwind after this helper has
+                            # returned. Never accept a late pre/post pair.
+                            stream_observed["closed"] = True
                             ended = time.time()
                             for context in stream_open.values():
                                 observe_attempt("post_api_attempt", context=context, response=None,

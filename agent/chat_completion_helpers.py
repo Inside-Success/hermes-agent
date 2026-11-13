@@ -2523,6 +2523,10 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                 logger.debug("stream dispatch observer failed", exc_info=True)
 
     def _observe_start(request):
+        # Client creation may have blocked while the caller cancelled the
+        # request. Do not dispatch or create a late observation afterwards.
+        if agent._interrupt_requested or _request_cancelled["value"]:
+            raise InterruptedError("Agent interrupted before streaming dispatch")
         observed_attempt["started"] = True
         observed_attempt["started_at"] = time.time()
         _observe_dispatch("pre", number=observed_attempt["number"], request=request,
@@ -3411,7 +3415,10 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                         result["response"] = _call_anthropic(request_client)
                     else:
                         result["response"] = _call_chat_completions(stream_attempt_id)
-                    if getattr(result["response"], "id", None) == PARTIAL_STREAM_STUB_ID:
+                    if agent._interrupt_requested or _request_cancelled["value"]:
+                        _observe_end(response=result["response"],
+                                     error=InterruptedError("Agent interrupted during streaming dispatch"))
+                    elif getattr(result["response"], "id", None) == PARTIAL_STREAM_STUB_ID:
                         _observe_end(response=result["response"],
                                      error=RuntimeError("provider returned incomplete streamed output"))
                     else:

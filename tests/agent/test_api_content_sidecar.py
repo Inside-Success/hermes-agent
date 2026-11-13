@@ -620,6 +620,44 @@ def _user_messages(req: dict) -> list:
 
 
 class TestWireInvariant:
+    def test_cancelled_helper_rejects_late_worker_observations(self, wire_env):
+        make_agent, _, _, _ = wire_env
+        agent = make_agent()
+        agent.stream_delta_callback = lambda text: None
+        release = threading.Event()
+        finished = threading.Event()
+        attempts = []
+
+        def fake_stream(kwargs, *, on_first_delta=None, attempt_observer=None):
+            def late_worker():
+                release.wait(5)
+                attempt_observer("pre", number=1, request=kwargs, started_at=0.0)
+                attempt_observer("post", number=1, response=None,
+                                 error=RuntimeError("late"), duration=0.0)
+                finished.set()
+            threading.Thread(target=late_worker, daemon=True).start()
+            agent._interrupt_requested = True
+            raise InterruptedError("synthetic cancellation")
+
+        def capture(event, **payload):
+            if event in {"pre_api_attempt", "post_api_attempt"}:
+                attempts.append((event, payload["api_attempt_id"]))
+            return []
+
+        try:
+            with patch.object(agent, "_interruptible_streaming_api_call", side_effect=fake_stream), \
+                 patch("hermes_cli.plugins.has_hook", side_effect=lambda event: event in {"pre_api_attempt", "post_api_attempt"}), \
+                 patch("hermes_cli.plugins.invoke_hook", side_effect=capture):
+                agent.run_conversation("read evidence", conversation_history=[], task_id="t")
+                before = list(attempts)
+                release.set()
+                assert finished.wait(5)
+                assert attempts == before
+                assert [event for event, _ in attempts] == ["pre_api_attempt", "post_api_attempt"]
+                assert attempts[0][1] == attempts[1][1]
+        finally:
+            release.set()
+
     def test_partial_stream_error_keeps_content_and_reasoning_in_export(self, wire_env, monkeypatch):
         import importlib
         import httpx
