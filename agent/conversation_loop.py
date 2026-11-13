@@ -2091,6 +2091,22 @@ def run_conversation(
                     _persist_tool_api_content_from_request(agent, next_api_kwargs, _current_tool_ids)
                     api_attempt_count += 1
                     attempt_started = time.time()
+
+                    def attempt_selection(request):
+                        selected = getattr(agent, "turn_model_selection", None)
+                        if not selected:
+                            return None
+                        keys = ("reasoning", "reasoning_effort", "thinking")
+                        reasoning = {key: request[key] for key in keys if key in request}
+                        extra = request.get("extra_body")
+                        if isinstance(extra, dict):
+                            extra_reasoning = {key: extra[key] for key in keys if key in extra}
+                            if extra_reasoning:
+                                reasoning["extra_body"] = extra_reasoning
+                        return {**selected, "effective_model": request.get("model", agent.model),
+                                "effective_provider": agent.provider, "effective_reasoning": reasoning,
+                                "effective_service_tier": request.get("service_tier")}
+
                     attempt_context = {
                         "task_id": effective_task_id,
                         "turn_id": turn_id,
@@ -2098,7 +2114,8 @@ def run_conversation(
                         "api_attempt_id": f"{api_request_id}:attempt:{api_attempt_count}",
                         "session_id": agent.session_id or "",
                         "platform": agent.platform or "",
-                        "model": agent.model,
+                        "model": next_api_kwargs.get("model", agent.model),
+                        "model_selection": attempt_selection(next_api_kwargs),
                         "provider": agent.provider,
                         "base_url": agent.base_url,
                         "api_mode": agent.api_mode,
@@ -2132,6 +2149,8 @@ def run_conversation(
                             if event == "pre":
                                 stream_observed["started"] = True
                                 context["request"] = request
+                                context["model"] = request.get("model", agent.model)
+                                context["model_selection"] = attempt_selection(request)
                                 context["started_at"] = started_at
                                 stream_open[number] = context
                                 observe_attempt("pre_api_attempt", context=context)

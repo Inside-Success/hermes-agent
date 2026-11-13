@@ -110,6 +110,25 @@ def test_complete_answer_and_exposed_reasoning_reach_sdk(plugin):
     assert generation.ended
 
 
+def test_full_capture_keeps_model_selection_receipt_at_root_and_generation(plugin):
+    _, client, hooks = plugin
+    receipt = {"selected_model": "selected-target", "effective_model": "fallback-actual",
+               "effective_provider": "synthetic", "effective_reasoning": {"reasoning_effort": "high"},
+               "effective_service_tier": "priority", "api_key": "synthetic-receipt-secret"}
+    kwargs = {**attempt_kwargs(), "model": "fallback-actual", "model_selection": receipt}
+    hooks["pre_api_attempt"](request={"model": "fallback-actual"}, **kwargs)
+    root = client.roots[0]
+    generation = root.children[0]
+    for metadata in (root.started["metadata"], generation.started["metadata"]):
+        selected = metadata["model_selection"]
+        assert selected["selected_model"] == "selected-target"
+        assert selected["effective_model"] == "fallback-actual"
+        assert selected["effective_reasoning"] == {"reasoning_effort": "high"}
+        assert selected["effective_service_tier"] == "priority"
+        assert selected["api_key"] == "[REDACTED]"
+    assert generation.started["model"] == "fallback-actual"
+
+
 def test_failed_and_successful_attempts_are_distinct(plugin):
     _, client, hooks = plugin
     hooks["pre_api_attempt"](request={"messages": [{"content": "unicode ☃"}]}, **attempt_kwargs())

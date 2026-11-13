@@ -787,7 +787,7 @@ def _start_root_trace(task_key: str, *, task_id: str, session_id: str, platform:
         metadata = _metadata_value(metadata)
 
     if model_selection is not None:
-        metadata["model_selection"] = _safe_value(model_selection)
+        metadata["model_selection"] = _metadata_value(model_selection) if _FULL_CONTENT else _safe_value(model_selection)
 
     # session_id must be passed in trace_context for Langfuse session grouping.
     trace_ctx: Dict[str, Any] = {"trace_id": trace_id}
@@ -1090,7 +1090,8 @@ def on_pre_api_attempt(*, request: Any = None, api_attempt_id: str = "",
                        task_id: str = "", session_id: str = "", turn_id: str = "",
                        api_request_id: str = "", api_call_count: int = 0,
                        platform: str = "", provider: str = "", model: str = "",
-                       api_mode: str = "", base_url: str = "", **_: Any) -> None:
+                       api_mode: str = "", base_url: str = "",
+                       model_selection: Optional[dict] = None, **_: Any) -> None:
     """Capture the synchronous snapshot before this Hermes dispatch attempt."""
     if not _FULL_CONTENT:
         return
@@ -1106,6 +1107,7 @@ def on_pre_api_attempt(*, request: Any = None, api_attempt_id: str = "",
         "api_attempt_id": api_attempt_id, "api_request_id": api_request_id,
         "provider": provider, "platform": platform, "api_mode": api_mode, "base_url": base_url,
         "available_message_count": len(messages) if isinstance(messages, list) else None,
+        **({"model_selection": model_selection} if model_selection is not None else {}),
     })
     with _STATE_LOCK:
         state = _TRACE_STATE.get(task_key)
@@ -1114,6 +1116,7 @@ def on_pre_api_attempt(*, request: Any = None, api_attempt_id: str = "",
                 task_key, task_id=task_id, session_id=session_id, platform=platform,
                 provider=provider, model=model, api_mode=api_mode, messages=messages,
                 client=client, turn_id=turn_id, api_request_id=api_request_id,
+                model_selection=model_selection,
             )
             _evict_stale_locked()
             _TRACE_STATE[task_key] = state

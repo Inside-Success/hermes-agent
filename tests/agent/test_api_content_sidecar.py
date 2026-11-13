@@ -727,6 +727,7 @@ class TestWireInvariant:
 
         make_agent, handler, _, _ = wire_env
         agent = make_agent()
+        agent.turn_model_selection = {"policy_revision": "test-policy", "selected_model": "policy-target"}
         agent.stream_delta_callback = lambda text: None
         handler.response_queue.append(_text_resp("done"))
         original_create = agent._create_request_openai_client
@@ -769,6 +770,11 @@ class TestWireInvariant:
             assert len({s.name for s in generations}) == 3
             assert sorted(s.attributes["langfuse.observation.metadata.status"] for s in generations) == ["error", "error", "success"]
             assert all(json.loads(s.attributes["langfuse.observation.input"])["stream"] for s in generations)
+            for span in generations:
+                request = json.loads(span.attributes["langfuse.observation.input"])
+                receipt = json.loads(span.attributes["langfuse.observation.metadata.model_selection"])
+                assert receipt["selected_model"] == "policy-target"
+                assert receipt["effective_model"] == request["model"]
         finally:
             client.shutdown()
 
