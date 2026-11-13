@@ -502,3 +502,53 @@ def test_full_capture_omits_content_if_secret_scope_cannot_be_enumerated(plugin)
             "omitted": True, "reason": "profile secrets unavailable"}
     finally:
         reset_secret_scope(token)
+
+
+def test_multiplex_without_context_emits_no_request_tool_or_completion(plugin):
+    from agent.secret_scope import set_multiplex_active
+    _, client, hooks = plugin
+    secret = "opaque-synthetic-profile-credential"
+    set_multiplex_active(True)
+    try:
+        hooks["pre_api_request"](request_messages=[{"role": "user", "content": secret}],
+                                 **attempt_kwargs())
+        hooks["pre_tool_call"](tool_name="demo", args={"text": secret}, **attempt_kwargs())
+        hooks["post_tool_call"](tool_name="demo", result=secret, **attempt_kwargs())
+        hooks["post_llm_call"](assistant_response=secret, **attempt_kwargs())
+        assert client.roots == []
+    finally:
+        set_multiplex_active(False)
+
+
+def test_preview_hooks_redact_scoped_opaque_credentials(plugin, tmp_path):
+    from agent.secret_scope import set_multiplex_active, set_secret_scope, reset_secret_scope
+    from hermes_constants import set_hermes_home_override, reset_hermes_home_override
+    _, client, hooks = plugin
+    home = tmp_path / "preview"
+    home.mkdir()
+    (home / "config.yaml").write_text("plugins: {}\n")
+    secret = "opaque-synthetic-profile-credential"
+    set_multiplex_active(True)
+    home_token = set_hermes_home_override(home)
+    scope_token = set_secret_scope({"CUSTOM_CREDENTIAL": secret})
+    try:
+        kwargs = attempt_kwargs()
+        hooks["pre_api_request"](request_messages=[{"role": "user", "content": secret}], **kwargs)
+        hooks["pre_tool_call"](tool_name="demo", args={"text": secret}, tool_call_id="tool", **kwargs)
+        hooks["post_tool_call"](tool_name="demo", result=secret, tool_call_id="tool", **kwargs)
+        hooks["post_llm_call"](assistant_response=secret, **kwargs)
+        root = client.roots[0]
+        exported = repr((root.started, root.updates, [(c.started, c.updates) for c in root.children]))
+        assert secret not in exported
+        assert "[REDACTED]" in exported
+    finally:
+        reset_secret_scope(scope_token)
+        reset_hermes_home_override(home_token)
+        set_multiplex_active(False)
+
+
+def test_malformed_profile_config_disables_former_opt_in(plugin, tmp_path):
+    mod, _, _ = plugin
+    assert mod._full_content_enabled()
+    (tmp_path / "config.yaml").write_text("plugins: [invalid\n")
+    assert not mod._full_content_enabled()

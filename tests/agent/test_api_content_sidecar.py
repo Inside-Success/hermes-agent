@@ -619,6 +619,26 @@ def _user_messages(req: dict) -> list:
     return [m for m in req.get("messages", []) if m.get("role") == "user"]
 
 
+@pytest.fixture
+def scoped_full_capture(tmp_path):
+    """Use real profile policy and credential context across streaming threads."""
+    from agent.secret_scope import (is_multiplex_active, set_multiplex_active,
+                                    set_secret_scope, reset_secret_scope)
+    from hermes_constants import set_hermes_home_override, reset_hermes_home_override
+    (tmp_path / "config.yaml").write_text(
+        "plugins:\n  entries:\n    observability/langfuse:\n      full_content: true\n")
+    previous = is_multiplex_active()
+    set_multiplex_active(True)
+    home_token = set_hermes_home_override(tmp_path)
+    secret_token = set_secret_scope({"SYNTHETIC_CREDENTIAL": "opaque-streaming-test-credential"})
+    try:
+        yield
+    finally:
+        reset_secret_scope(secret_token)
+        reset_hermes_home_override(home_token)
+        set_multiplex_active(previous)
+
+
 class TestWireInvariant:
     def test_cancelled_helper_rejects_late_worker_observations(self, wire_env):
         make_agent, _, _, _ = wire_env
@@ -658,7 +678,7 @@ class TestWireInvariant:
         finally:
             release.set()
 
-    def test_partial_stream_error_keeps_content_and_reasoning_in_export(self, wire_env, monkeypatch):
+    def test_partial_stream_error_keeps_content_and_reasoning_in_export(self, wire_env, monkeypatch, scoped_full_capture):
         import importlib
         import httpx
         from types import SimpleNamespace
@@ -691,7 +711,6 @@ class TestWireInvariant:
         exporter = InMemorySpanExporter()
         client = langfuse.Langfuse(public_key="pk-lf-test-stream-partial", secret_key="sk-lf-test",
                                   span_exporter=exporter, sample_rate=1.0)
-        monkeypatch.setattr(plugin, "_full_content_enabled", lambda: True)
         monkeypatch.setattr(plugin, "_get_langfuse", lambda: client)
         monkeypatch.setattr(plugin, "propagate_attributes", None)
         hooks = {"pre_api_attempt": plugin.on_pre_api_attempt,
@@ -719,7 +738,7 @@ class TestWireInvariant:
         finally:
             client.shutdown()
 
-    def test_stream_retries_create_one_exported_generation_per_dispatch(self, wire_env, monkeypatch):
+    def test_stream_retries_create_one_exported_generation_per_dispatch(self, wire_env, monkeypatch, scoped_full_capture):
         import importlib
         import httpx
         langfuse = pytest.importorskip("langfuse")
@@ -745,7 +764,6 @@ class TestWireInvariant:
         exporter = InMemorySpanExporter()
         client = langfuse.Langfuse(public_key="pk-lf-test-stream-retries", secret_key="sk-lf-test",
                                   span_exporter=exporter, sample_rate=1.0)
-        monkeypatch.setattr(plugin, "_full_content_enabled", lambda: True)
         monkeypatch.setattr(plugin, "_get_langfuse", lambda: client)
         monkeypatch.setattr(plugin, "propagate_attributes", None)
         monkeypatch.setenv("HERMES_STREAM_RETRIES", "2")
@@ -1416,3 +1434,65 @@ class TestStaleConfirmationRedactionDropsSidecar:
         )
         assert cleaned[0]["content"] != "confirm forced restart"
         assert "api_content" not in cleaned[0]
+
+
+def test_concurrent_profile_streaming_uses_each_profile_policy(wire_env, monkeypatch, tmp_path):
+    from concurrent.futures import ThreadPoolExecutor
+    from agent.secret_scope import (is_multiplex_active, set_multiplex_active,
+                                    set_secret_scope, reset_secret_scope)
+    from hermes_constants import set_hermes_home_override, reset_hermes_home_override
+    from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
+    import importlib
+
+    langfuse = pytest.importorskip("langfuse")
+    plugin = importlib.import_module("plugins.observability.langfuse")
+    make_agent, handler, _, _ = wire_env
+    agents = [make_agent(), make_agent()]
+    for agent in agents:
+        agent.stream_delta_callback = lambda text: None
+    handler.response_queue.extend([_text_resp("done"), _text_resp("done")])
+    homes = []
+    for name, enabled in (("enabled", "true"), ("disabled", "false")):
+        home = tmp_path / name
+        home.mkdir()
+        (home / "config.yaml").write_text(
+            "plugins:\n  entries:\n    observability/langfuse:\n      full_content: " + enabled + "\n")
+        homes.append(home)
+    exporter = InMemorySpanExporter()
+    client = langfuse.Langfuse(public_key="pk-lf-test-concurrent-profiles", secret_key="sk-lf-test",
+                               span_exporter=exporter, sample_rate=1.0)
+    monkeypatch.setattr(plugin, "_get_langfuse", lambda: client)
+    monkeypatch.setattr(plugin, "propagate_attributes", None)
+    hooks = {"pre_api_attempt": plugin.on_pre_api_attempt,
+             "post_api_attempt": plugin.on_post_api_attempt,
+             "post_llm_call": plugin.on_post_llm_call}
+    barrier = threading.Barrier(2)
+    def invoke(event, **payload):
+        if event in hooks:
+            hooks[event](**payload)
+        return []
+    def run(index):
+        home_token = set_hermes_home_override(homes[index])
+        scope_token = set_secret_scope({"SYNTHETIC_CREDENTIAL": "opaque-profile-value-" + str(index)})
+        try:
+            barrier.wait(timeout=10)
+            agents[index].run_conversation("profile message " + str(index), conversation_history=[],
+                                           task_id="profile-task-" + str(index))
+        finally:
+            reset_secret_scope(scope_token)
+            reset_hermes_home_override(home_token)
+    previous = is_multiplex_active()
+    set_multiplex_active(True)
+    try:
+        with patch("hermes_cli.plugins.has_hook", side_effect=lambda event: event in hooks), \
+             patch("hermes_cli.plugins.invoke_hook", side_effect=invoke), ThreadPoolExecutor(max_workers=2) as pool:
+            list(pool.map(run, range(2)))
+        client.flush()
+        generations = [span for span in exporter.get_finished_spans() if span.name.startswith("LLM attempt ")]
+        assert len(generations) == 1
+        request = json.loads(generations[0].attributes["langfuse.observation.input"])
+        assert "profile message 0" in json.dumps(request)
+        assert "profile message 1" not in json.dumps(request)
+    finally:
+        set_multiplex_active(previous)
+        client.shutdown()

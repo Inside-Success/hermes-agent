@@ -23,6 +23,7 @@ Optional env vars:
 from __future__ import annotations
 
 import json
+from functools import wraps
 import logging
 import math
 import os
@@ -104,16 +105,38 @@ _SCHEMA_MARKERS = {"type", "$ref", "$dynamicRef"} | _SCHEMA_MAP_KEYS | _SCHEMA_N
 _SCHEMA_VALUE_KEYS = {"default", "const", "enum", "examples", "example"}
 
 
-def _full_content_enabled() -> bool:
-    """Resolve capture policy in the current profile context, never at registration."""
+def _capture_context_available() -> bool:
+    """Do not emit even previews without the multiplexed profile's secrets."""
     try:
         from agent.secret_scope import current_secret_scope, is_multiplex_active
         from hermes_constants import get_hermes_home_override
-        from hermes_cli.config import load_config_readonly
-
-        if is_multiplex_active() and (current_secret_scope() is None or not get_hermes_home_override()):
+        scope = current_secret_scope()
+        if is_multiplex_active() and (scope is None or not get_hermes_home_override()):
             return False
-        entries = ((load_config_readonly() or {}).get("plugins") or {}).get("entries") or {}
+        return scope is None or all(isinstance(value, str) for value in scope.values())
+    except Exception:
+        return False
+
+
+def _require_capture_context(fn):
+    @wraps(fn)
+    def guarded(*args, **kwargs):
+        if _capture_context_available():
+            return fn(*args, **kwargs)
+        return None
+    return guarded
+
+
+def _full_content_enabled() -> bool:
+    """Only a currently readable, explicit profile opt-in enables capture."""
+    if not _capture_context_available():
+        return False
+    try:
+        import yaml
+        from hermes_cli.config import get_config_path
+        with get_config_path().open(encoding="utf-8") as stream:
+            config = yaml.safe_load(stream)
+        entries = ((config or {}).get("plugins") or {}).get("entries") or {}
         return (entries.get("observability/langfuse") or {}).get("full_content", False) is True
     except Exception:
         return False
@@ -260,7 +283,7 @@ def _content_value(value: Any, **preview_kwargs: Any) -> Any:
 
 
 def _metadata_value(value: Any) -> Any:
-    return _safe_value(_full_value(value)) if _full_content_enabled() else value
+    return _safe_value(value)
 
 # Langfuse-issued keys always carry these prefixes (cloud or self-hosted —
 # the prefix is baked into the server-side issuance flow, not a UI hint).
@@ -618,6 +641,14 @@ def _normalize_payload(value: Any, *, tool_name: str = "", args: Any = None) -> 
 
 def _safe_value(value: Any, *, max_chars: Optional[int] = None, depth: int = 0,
                 parse_json_strings: bool = False) -> Any:
+    # Credential redaction precedes preview truncation; otherwise opaque
+    # profile-scoped secrets can be exported in ordinary bounded traces.
+    return _safe_value_impl(_full_value(value), max_chars=max_chars, depth=depth,
+                            parse_json_strings=parse_json_strings)
+
+
+def _safe_value_impl(value: Any, *, max_chars: Optional[int] = None, depth: int = 0,
+                parse_json_strings: bool = False) -> Any:
     max_chars = max_chars if max_chars is not None else int(_env("HERMES_LANGFUSE_MAX_CHARS", "12000") or "12000")
     if depth > 4:
         return "<max-depth>"
@@ -629,23 +660,23 @@ def _safe_value(value: Any, *, max_chars: Optional[int] = None, depth: int = 0,
         if parse_json_strings:
             parsed = _maybe_parse_json_string(value)
             if parsed is not value:
-                return _safe_value(parsed, max_chars=max_chars, depth=depth, parse_json_strings=True)
+                return _safe_value_impl(parsed, max_chars=max_chars, depth=depth, parse_json_strings=True)
         return _truncate_text(value, max_chars)
     if isinstance(value, dict):
         normalized = _normalize_payload(value)
         if normalized is not value:
-            return _safe_value(normalized, max_chars=max_chars, depth=depth, parse_json_strings=parse_json_strings)
+            return _safe_value_impl(normalized, max_chars=max_chars, depth=depth, parse_json_strings=parse_json_strings)
         return {
-            str(k): _safe_value(v, max_chars=max_chars, depth=depth + 1, parse_json_strings=parse_json_strings)
+            str(k): _safe_value_impl(v, max_chars=max_chars, depth=depth + 1, parse_json_strings=parse_json_strings)
             for k, v in list(value.items())[:50]
         }
     if isinstance(value, (list, tuple, set)):
         return [
-            _safe_value(v, max_chars=max_chars, depth=depth + 1, parse_json_strings=parse_json_strings)
+            _safe_value_impl(v, max_chars=max_chars, depth=depth + 1, parse_json_strings=parse_json_strings)
             for v in list(value)[:50]
         ]
     if hasattr(value, "__dict__"):
-        return _safe_value(vars(value), max_chars=max_chars, depth=depth + 1, parse_json_strings=parse_json_strings)
+        return _safe_value_impl(vars(value), max_chars=max_chars, depth=depth + 1, parse_json_strings=parse_json_strings)
     return _truncate_text(repr(value), max_chars)
 
 
@@ -812,7 +843,7 @@ def _start_root_trace(task_key: str, *, task_id: str, session_id: str, platform:
     }
     if _full_content_enabled():
         metadata.update(full_content=True, captured_scope="hermes_dispatch_attempt", redacted=True)
-        metadata = _metadata_value(metadata)
+    metadata = _metadata_value(metadata)
 
     if model_selection is not None:
         metadata["model_selection"] = _metadata_value(model_selection) if _full_content_enabled() else _safe_value(model_selection)
@@ -820,12 +851,12 @@ def _start_root_trace(task_key: str, *, task_id: str, session_id: str, platform:
     # session_id must be passed in trace_context for Langfuse session grouping.
     trace_ctx: Dict[str, Any] = {"trace_id": trace_id}
     if session_id:
-        trace_ctx["session_id"] = session_id
+        trace_ctx["session_id"] = _full_value(session_id)
 
     if propagate_attributes is not None:
         try:
             with propagate_attributes(
-                session_id=session_id or task_key,
+                session_id=_full_value(session_id or task_key),
                 trace_name="Hermes turn",
                 tags=["hermes", "langfuse"],
             ):
@@ -872,11 +903,11 @@ def _start_child_observation(state: TraceState, *, client: Langfuse, name: str, 
                              input_value: Any, metadata: Optional[dict] = None,
                              model: Optional[str] = None, model_parameters: Optional[dict] = None) -> Any:
     return state.root_span.start_observation(
-        name=name,
+        name=_full_value(name),
         as_type=as_type,
-        input=input_value,
+        input=_full_value(input_value),
         metadata=_metadata_value(metadata or {}),
-        model=_content_value(model) if _full_content_enabled() else model,
+        model=_content_value(model),
         model_parameters=_metadata_value(model_parameters),
     )
 
@@ -888,9 +919,9 @@ def _end_observation(observation: Any, *, output: Any = None, metadata: Optional
     try:
         update_kwargs: Dict[str, Any] = {}
         if output is not None:
-            update_kwargs["output"] = output
+            update_kwargs["output"] = _full_value(output)
         if metadata:
-            update_kwargs["metadata"] = metadata
+            update_kwargs["metadata"] = _full_value(metadata)
         if usage_details:
             update_kwargs["usage_details"] = usage_details
         if cost_details:
@@ -953,7 +984,7 @@ def _finish_trace(task_key: str, *, output: Any = None) -> None:
         for queue in state.pending_tools_by_name.values():
             for observation in queue:
                 _end_observation(observation)
-        final_output = _merge_trace_output(output, state)
+        final_output = _full_value(_merge_trace_output(output, state))
         if final_output is not None:
             state.root_span.set_trace_io(output=final_output)
             state.root_span.update(output=final_output)
@@ -975,6 +1006,7 @@ def _request_key(api_call_count: Any) -> str:
     return str(api_call_count or 0)
 
 
+@_require_capture_context
 def on_pre_llm_call(*, task_id: str = "", session_id: str = "", platform: str = "", model: str = "",
                     provider: str = "", base_url: str = "", api_mode: str = "",
                     api_call_count: int = 0, messages: Any = None, turn_type: str = "user",
@@ -1026,6 +1058,7 @@ def on_pre_llm_call(*, task_id: str = "", session_id: str = "", platform: str = 
         state.last_updated_at = time.time()
 
 
+@_require_capture_context
 def on_pre_llm_request(
     *,
     task_id: str = "",
@@ -1114,6 +1147,7 @@ def on_pre_llm_request(
         )
 
 
+@_require_capture_context
 def on_pre_api_attempt(*, request: Any = None, api_attempt_id: str = "",
                        task_id: str = "", session_id: str = "", turn_id: str = "",
                        api_request_id: str = "", api_call_count: int = 0,
@@ -1156,6 +1190,7 @@ def on_pre_api_attempt(*, request: Any = None, api_attempt_id: str = "",
         )
 
 
+@_require_capture_context
 def on_post_api_attempt(*, response: Any = None, error: Any = None, partial: Any = None,
                         api_attempt_id: str = "", task_id: str = "", session_id: str = "",
                         turn_id: str = "", api_request_id: str = "", provider: str = "",
@@ -1181,6 +1216,7 @@ def on_post_api_attempt(*, response: Any = None, error: Any = None, partial: Any
     )
 
 
+@_require_capture_context
 def on_post_llm_call(*, task_id: str = "", session_id: str = "", provider: str = "", base_url: str = "",
                      api_mode: str = "", model: str = "", api_call_count: int = 0,
                      assistant_message: Any = None, response: Any = None,
@@ -1322,6 +1358,7 @@ def on_post_llm_call(*, task_id: str = "", session_id: str = "", provider: str =
         _finish_trace(task_key, output=output)
 
 
+@_require_capture_context
 def on_pre_tool_call(*, tool_name: str = "", args: Any = None, task_id: str = "",
                      session_id: str = "", tool_call_id: str = "",
                      turn_id: str = "", api_request_id: str = "", **_: Any) -> None:
@@ -1354,6 +1391,7 @@ def on_pre_tool_call(*, tool_name: str = "", args: Any = None, task_id: str = ""
             state.pending_tools_by_name.setdefault(tool_name, []).append(observation)
 
 
+@_require_capture_context
 def on_post_tool_call(*, tool_name: str = "", args: Any = None, result: Any = None,
                       task_id: str = "", session_id: str = "", tool_call_id: str = "",
                       turn_id: str = "", api_request_id: str = "", **_: Any) -> None:
