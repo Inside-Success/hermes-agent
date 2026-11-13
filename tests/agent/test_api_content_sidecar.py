@@ -691,7 +691,7 @@ class TestWireInvariant:
         exporter = InMemorySpanExporter()
         client = langfuse.Langfuse(public_key="pk-lf-test-stream-partial", secret_key="sk-lf-test",
                                   span_exporter=exporter, sample_rate=1.0)
-        monkeypatch.setattr(plugin, "_FULL_CONTENT", True)
+        monkeypatch.setattr(plugin, "_full_content_enabled", lambda: True)
         monkeypatch.setattr(plugin, "_get_langfuse", lambda: client)
         monkeypatch.setattr(plugin, "propagate_attributes", None)
         hooks = {"pre_api_attempt": plugin.on_pre_api_attempt,
@@ -745,7 +745,7 @@ class TestWireInvariant:
         exporter = InMemorySpanExporter()
         client = langfuse.Langfuse(public_key="pk-lf-test-stream-retries", secret_key="sk-lf-test",
                                   span_exporter=exporter, sample_rate=1.0)
-        monkeypatch.setattr(plugin, "_FULL_CONTENT", True)
+        monkeypatch.setattr(plugin, "_full_content_enabled", lambda: True)
         monkeypatch.setattr(plugin, "_get_langfuse", lambda: client)
         monkeypatch.setattr(plugin, "propagate_attributes", None)
         monkeypatch.setenv("HERMES_STREAM_RETRIES", "2")

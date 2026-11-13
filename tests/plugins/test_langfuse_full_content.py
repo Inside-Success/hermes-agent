@@ -427,3 +427,78 @@ def test_real_sdk_excludes_credentials_in_each_source_shape(plugin, monkeypatch,
             assert prop["type"] == "string" and prop["description"] == "Credential input"
     finally:
         client.shutdown()
+
+
+def test_profile_policy_and_scoped_secrets_are_isolated_across_async_tasks(plugin, tmp_path):
+    import asyncio
+    from contextvars import copy_context
+    from agent.secret_scope import set_multiplex_active, set_secret_scope, reset_secret_scope
+    from hermes_constants import set_hermes_home_override, reset_hermes_home_override
+
+    mod, client, hooks = plugin
+    homes = []
+    for name, enabled in (("enabled", True), ("disabled", False)):
+        home = tmp_path / name
+        home.mkdir()
+        (home / "config.yaml").write_text(yaml.safe_dump({"plugins": {"entries": {
+            "observability/langfuse": {"full_content": enabled}}}}))
+        homes.append(home)
+
+    async def exercise():
+        arrived = asyncio.Event()
+        count = 0
+        async def run(home, enabled):
+            nonlocal count
+            home_token = set_hermes_home_override(home)
+            secret = "synthetic-profile-secret-" + home.name
+            scope_token = set_secret_scope({"CUSTOM_CREDENTIAL": secret})
+            try:
+                count += 1
+                if count == 2:
+                    arrived.set()
+                await arrived.wait()
+                await asyncio.sleep(0)
+                assert mod._full_content_enabled() is enabled
+                # Exercise the same context copying used for gateway worker threads.
+                thread_policy = await asyncio.to_thread(copy_context().run, mod._full_content_enabled)
+                assert thread_policy is enabled
+                hooks["pre_api_attempt"](
+                    request={"message": "opaque value " + secret},
+                    **{**attempt_kwargs(), "turn_id": home.name},
+                )
+                if enabled:
+                    result = mod._full_value({"message": "opaque value " + secret})
+                    assert result == {"message": "opaque value [REDACTED]"}
+                return mod._content_value("x" * 13000)
+            finally:
+                reset_secret_scope(scope_token)
+                reset_hermes_home_override(home_token)
+        return await asyncio.gather(run(homes[0], True), run(homes[1], False))
+
+    set_multiplex_active(True)
+    try:
+        full, preview = asyncio.run(exercise())
+        assert len(full) == 13000
+        assert len(preview) < 13000
+        assert len(client.roots) == 1
+        assert client.roots[0].children[0].started["input"] == {
+            "message": "opaque value [REDACTED]"}
+        assert not mod._full_content_enabled()
+        assert mod._full_value("anything") == {"omitted": True, "reason": "profile secrets unavailable"}
+    finally:
+        set_multiplex_active(False)
+
+
+def test_full_capture_omits_content_if_secret_scope_cannot_be_enumerated(plugin):
+    from agent.secret_scope import set_secret_scope, reset_secret_scope
+
+    mod, _, _ = plugin
+    class BadScope(dict):
+        def values(self):
+            raise RuntimeError("unavailable")
+    token = set_secret_scope(BadScope())
+    try:
+        assert mod._full_value("sensitive content") == {
+            "omitted": True, "reason": "profile secrets unavailable"}
+    finally:
+        reset_secret_scope(token)

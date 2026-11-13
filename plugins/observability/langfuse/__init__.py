@@ -65,7 +65,6 @@ _TRACE_STATE: Dict[str, TraceState] = {}
 # to bound the leak from non-finalizing turns, not to limit concurrency.
 _MAX_TRACE_STATE = 256
 _LANGFUSE_CLIENT = None
-_FULL_CONTENT = False
 _READ_FILE_LINE_RE = re.compile(r"^\s*(\d+)\|(.*)$")
 _READ_FILE_HEAD_LINES = 25
 _READ_FILE_TAIL_LINES = 15
@@ -105,6 +104,21 @@ _SCHEMA_MARKERS = {"type", "$ref", "$dynamicRef"} | _SCHEMA_MAP_KEYS | _SCHEMA_N
 _SCHEMA_VALUE_KEYS = {"default", "const", "enum", "examples", "example"}
 
 
+def _full_content_enabled() -> bool:
+    """Resolve capture policy in the current profile context, never at registration."""
+    try:
+        from agent.secret_scope import current_secret_scope, is_multiplex_active
+        from hermes_constants import get_hermes_home_override
+        from hermes_cli.config import load_config_readonly
+
+        if is_multiplex_active() and (current_secret_scope() is None or not get_hermes_home_override()):
+            return False
+        entries = ((load_config_readonly() or {}).get("plugins") or {}).get("entries") or {}
+        return (entries.get("observability/langfuse") or {}).get("full_content", False) is True
+    except Exception:
+        return False
+
+
 def _full_value(value: Any) -> Any:
     """Copy complete JSON model source content, redacting credentials first.
 
@@ -115,8 +129,22 @@ def _full_value(value: Any) -> Any:
     """
     from agent.redact import redact_sensitive_text
 
-    secrets = sorted({v for k, v in os.environ.items()
-                      if v and _sensitive_content_key(k)}, key=len, reverse=True)
+    try:
+        from agent.secret_scope import current_secret_scope, is_multiplex_active
+        scope = current_secret_scope()
+        if is_multiplex_active() and scope is None:
+            return {"omitted": True, "reason": "profile secrets unavailable"}
+        scoped_values = set()
+        if scope is not None:
+            for scoped_value in scope.values():
+                if not isinstance(scoped_value, str):
+                    return {"omitted": True, "reason": "profile secrets unavailable"}
+                if scoped_value:
+                    scoped_values.add(scoped_value)
+        secrets = sorted(scoped_values | {v for k, v in os.environ.items()
+                         if v and _sensitive_content_key(k)}, key=len, reverse=True)
+    except Exception:
+        return {"omitted": True, "reason": "profile secrets unavailable"}
     active: set[int] = set()
 
     def text_value(text: str) -> str:
@@ -228,11 +256,11 @@ def _full_value(value: Any) -> Any:
 
 
 def _content_value(value: Any, **preview_kwargs: Any) -> Any:
-    return _full_value(value) if _FULL_CONTENT else _safe_value(value, **preview_kwargs)
+    return _full_value(value) if _full_content_enabled() else _safe_value(value, **preview_kwargs)
 
 
 def _metadata_value(value: Any) -> Any:
-    return _safe_value(_full_value(value)) if _FULL_CONTENT else value
+    return _safe_value(_full_value(value)) if _full_content_enabled() else value
 
 # Langfuse-issued keys always carry these prefixes (cloud or self-hosted —
 # the prefix is baked into the server-side issuance flow, not a UI hint).
@@ -782,12 +810,12 @@ def _start_root_trace(task_key: str, *, task_id: str, session_id: str, platform:
         "model": model,
         "api_mode": api_mode,
     }
-    if _FULL_CONTENT:
+    if _full_content_enabled():
         metadata.update(full_content=True, captured_scope="hermes_dispatch_attempt", redacted=True)
         metadata = _metadata_value(metadata)
 
     if model_selection is not None:
-        metadata["model_selection"] = _metadata_value(model_selection) if _FULL_CONTENT else _safe_value(model_selection)
+        metadata["model_selection"] = _metadata_value(model_selection) if _full_content_enabled() else _safe_value(model_selection)
 
     # session_id must be passed in trace_context for Langfuse session grouping.
     trace_ctx: Dict[str, Any] = {"trace_id": trace_id}
@@ -848,7 +876,7 @@ def _start_child_observation(state: TraceState, *, client: Langfuse, name: str, 
         as_type=as_type,
         input=input_value,
         metadata=_metadata_value(metadata or {}),
-        model=_content_value(model) if _FULL_CONTENT else model,
+        model=_content_value(model) if _full_content_enabled() else model,
         model_parameters=_metadata_value(model_parameters),
     )
 
@@ -952,7 +980,7 @@ def on_pre_llm_call(*, task_id: str = "", session_id: str = "", platform: str = 
                     api_call_count: int = 0, messages: Any = None, turn_type: str = "user",
                     conversation_history: Any = None, user_message: Any = None,
                     turn_id: str = "", api_request_id: str = "", **_: Any) -> None:
-    if _FULL_CONTENT:
+    if _full_content_enabled():
         return
     # Older Hermes branches used pre_llm_call for request-scoped tracing and
     # passed the actual API messages. Current Hermes also has a turn-scoped
@@ -1023,7 +1051,7 @@ def on_pre_llm_request(
     model_selection: Optional[dict] = None,
     **_: Any,
 ) -> None:
-    if _FULL_CONTENT:
+    if _full_content_enabled():
         return
     client = _get_langfuse()
     if client is None:
@@ -1093,7 +1121,7 @@ def on_pre_api_attempt(*, request: Any = None, api_attempt_id: str = "",
                        api_mode: str = "", base_url: str = "",
                        model_selection: Optional[dict] = None, **_: Any) -> None:
     """Capture the synchronous snapshot before this Hermes dispatch attempt."""
-    if not _FULL_CONTENT:
+    if not _full_content_enabled():
         return
     client = _get_langfuse()
     if client is None:
@@ -1133,7 +1161,7 @@ def on_post_api_attempt(*, response: Any = None, error: Any = None, partial: Any
                         turn_id: str = "", api_request_id: str = "", provider: str = "",
                         model: str = "", api_mode: str = "", base_url: str = "",
                         duration: float = 0.0, **_: Any) -> None:
-    if not _FULL_CONTENT:
+    if not _full_content_enabled():
         return
     task_key = _trace_key(task_id, session_id, turn_id=turn_id, api_request_id=api_request_id)
     with _STATE_LOCK:
@@ -1161,7 +1189,7 @@ def on_post_llm_call(*, task_id: str = "", session_id: str = "", provider: str =
                      assistant_tool_call_count: int = 0, assistant_response: Any = None,
                      turn_id: str = "", api_request_id: str = "",
                      **_: Any) -> None:
-    if _FULL_CONTENT:
+    if _full_content_enabled():
         # post_api_request carries api_request_id; only the later turn hook
         # closes the chain. It must not consume an in-flight attempt span.
         if not api_request_id:
@@ -1353,13 +1381,13 @@ def on_post_tool_call(*, tool_name: str = "", args: Any = None, result: Any = No
     if observation is None:
         return
 
-    if _FULL_CONTENT:
+    if _full_content_enabled():
         safe_result_value = _full_value(result)
     elif isinstance(result, str):
         result_value = _maybe_parse_json_string(result)
     else:
         result_value = result
-    if not _FULL_CONTENT:
+    if not _full_content_enabled():
         result_value = _normalize_payload(result_value, tool_name=tool_name, args=args)
         safe_result_value = _safe_value(result_value, parse_json_strings=True)
 
@@ -1384,14 +1412,6 @@ def on_post_tool_call(*, tool_name: str = "", args: Any = None, result: Any = No
 
 
 def register(ctx) -> None:
-    global _FULL_CONTENT
-    # Load once at plugin registration; never re-read config per hook.
-    try:
-        from hermes_cli.config import load_config
-        entries = ((load_config() or {}).get("plugins") or {}).get("entries") or {}
-        _FULL_CONTENT = (entries.get("observability/langfuse") or {}).get("full_content", False) is True
-    except Exception:
-        _FULL_CONTENT = False
     # Register for both hook name variants so the plugin works across
     # Hermes versions.  pre_api_request / post_api_request fire per API
     # call (preferred); pre_llm_call / post_llm_call fire once per turn.
