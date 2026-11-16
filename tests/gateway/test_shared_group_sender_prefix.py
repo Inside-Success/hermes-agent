@@ -2,7 +2,7 @@ import pytest
 
 from gateway.config import GatewayConfig, Platform, PlatformConfig
 from gateway.platforms.base import MessageEvent
-from gateway.run import GatewayRunner
+from gateway.run import GatewayRunner, build_resume_recovery_note
 from gateway.session import SessionSource
 
 
@@ -129,3 +129,46 @@ async def test_preprocess_slack_shared_thread_without_user_id_keeps_name_only():
     )
 
     assert result == "[Alice] hello"
+
+
+@pytest.mark.asyncio
+async def test_preprocess_leaves_blank_internal_resume_turn_unlabeled():
+    """The startup auto-resume turn is a synthetic, empty internal event.
+
+    It must not be attributed to the last human speaker. A bare
+    ``[Alice | Slack user <@U123>] `` label turns the blank turn into what
+    looks like a real (empty) user message: the restart recovery note then
+    tells the model to answer a NEW message, the blank-turn guard never
+    fires, and the bot replies "I didn't receive any text" in a shared
+    Slack thread.
+    """
+    runner = _make_runner(
+        GatewayConfig(
+            platforms={
+                Platform.SLACK: PlatformConfig(enabled=True, token="fake"),
+            },
+        )
+    )
+    source = SessionSource(
+        platform=Platform.SLACK,
+        chat_id="C123",
+        chat_name="team-channel",
+        chat_type="group",
+        user_id="U123",
+        user_name="Alice",
+        thread_id="171.000",
+    )
+    event = MessageEvent(text="", source=source, internal=True)
+
+    result = await runner._prepare_inbound_message_text(
+        event=event,
+        source=source,
+        history=[],
+    )
+
+    assert not (result or "").strip()
+    # The recovery note for this turn must be the one for a blank turn, not
+    # the one that tells the model to answer a new user message.
+    assert build_resume_recovery_note("restart_timeout", result or "") == (
+        build_resume_recovery_note("restart_timeout", "")
+    )
