@@ -34,37 +34,42 @@ def home():
     return base
 
 
+def memory_id(index):
+    from agent.learning_graph import _memory_cards
+    return _memory_cards()[index]['id']
+
+
 def test_parse_node_kind():
     assert lm.parse_node_kind("memory:memory:0") == "memory"
     assert lm.parse_node_kind("memory:profile:3") == "memory"
     assert lm.parse_node_kind("debugging-hermes") == "skill"
 
 
-def test_memory_global_index_maps_across_files(home):
-    # MEMORY.md → indices 0,1; USER.md → index 2 (global, memory cards first).
-    assert lm.node_detail("memory:memory:0")["content"].startswith("alpha note")
-    assert lm.node_detail("memory:memory:1")["content"] == "beta note"
-    assert lm.node_detail("memory:profile:2")["content"] == "user profile note"
+def test_memory_revision_handles_map_across_files(home):
+    # Resolve revision-bound handles from the current list across both files.
+    assert lm.node_detail(memory_id(0))["content"].startswith("alpha note")
+    assert lm.node_detail(memory_id(1))["content"] == "beta note"
+    assert lm.node_detail(memory_id(2))["content"] == "user profile note"
 
 
 def test_memory_label_is_first_line(home):
-    assert lm.node_detail("memory:memory:0")["label"] == "alpha note"
+    assert lm.node_detail(memory_id(0))["label"] == "alpha note"
 
 
 def test_delete_memory_rewrites_file(home):
-    assert lm.delete_node("memory:memory:0")["ok"]
+    assert lm.delete_node(memory_id(0))["ok"]
     remaining = (home / "memories" / "MEMORY.md").read_text(encoding="utf-8")
     assert "alpha note" not in remaining
     assert "beta note" in remaining
 
 
 def test_edit_memory_replaces_chunk(home):
-    assert lm.edit_node("memory:profile:2", "rewritten profile")["ok"]
+    assert lm.edit_node(memory_id(2), "rewritten profile")["ok"]
     assert (home / "memories" / "USER.md").read_text(encoding="utf-8").strip() == "rewritten profile"
 
 
 def test_edit_memory_empty_is_rejected(home):
-    res = lm.edit_node("memory:memory:1", "   ")
+    res = lm.edit_node(memory_id(1), "   ")
     assert not res["ok"]
     assert "delete" in res["message"]
 
@@ -120,7 +125,7 @@ def test_memory_writes_match_memory_tool_format(home):
     surfaces never fight over format and indices stay aligned."""
     from tools.memory_tool import ENTRY_DELIMITER, MemoryStore
 
-    assert lm.edit_node("memory:memory:0", "alpha rewritten")["ok"]
+    assert lm.edit_node(memory_id(0), "alpha rewritten")["ok"]
     path = home / "memories" / "MEMORY.md"
     entries = MemoryStore._read_file(path)
 

@@ -844,8 +844,8 @@ class TestUnreadableFileDoesNotWipeMemory:
 
     @staticmethod
     def _fail_read_once(monkeypatch, path):
-        """Make ``path.read_text`` raise OSError exactly once, else pass through."""
-        real = Path.read_text
+        """Make ``path.read_bytes`` raise OSError exactly once, else pass through."""
+        real = Path.read_bytes
         state = {"failed": False}
 
         def flaky(self, *a, **k):
@@ -854,7 +854,7 @@ class TestUnreadableFileDoesNotWipeMemory:
                 raise OSError("transient: file temporarily unavailable")
             return real(self, *a, **k)
 
-        monkeypatch.setattr(Path, "read_text", flaky)
+        monkeypatch.setattr(Path, "read_bytes", flaky)
 
     def test_add_refuses_and_preserves_memory_on_read_failure(
         self, store, monkeypatch,
@@ -967,34 +967,21 @@ class TestUnreadableFileDoesNotWipeMemory:
         assert "could not be read" in result["error"]
         assert path.read_bytes() == original_bytes  # nothing rewritten
 
-    def test_mutations_read_the_file_exactly_once(self, store, monkeypatch):
-        """Drift detection must use the SAME snapshot as the reload parse.
-
-        The drift guard used to re-read the file itself and swallow a failed
-        second read as "no drift" — a read failure between the checked reload
-        and the drift check let `replace` rewrite the file from a stale view,
-        discarding externally added entries. Pin the invariant structurally:
-        one mutation, one read.
-        """
+    def test_materialization_refuses_changed_snapshot(self, store, monkeypatch):
+        """An external write after reload must be detected before materialization."""
         store.add("memory", "Only entry.")
         path = store._path_for("memory")
+        original = MemoryStore._native_snapshot
 
-        real = Path.read_text
-        counts = {"n": 0}
+        def interleave(self, target, raw):
+            items = original(self, target, raw)
+            path.write_text("external newer entry", encoding="utf-8")
+            return items
 
-        def counting(self, *a, **k):
-            if self == path:
-                counts["n"] += 1
-            return real(self, *a, **k)
-
-        monkeypatch.setattr(Path, "read_text", counting)
-        result = store.replace("memory", "Only entry", "Replaced entry.")
-
-        assert result["success"] is True
-        assert counts["n"] == 1, (
-            f"replace() read the memory file {counts['n']} times; drift "
-            f"detection must reuse the single checked-read snapshot"
-        )
+        monkeypatch.setattr(MemoryStore, "_native_snapshot", interleave)
+        with pytest.raises(RuntimeError, match="changed before materialization"):
+            store.replace("memory", "Only entry", "Replaced entry.")
+        assert path.read_text() == "external newer entry"
 
 
 # =========================================================================

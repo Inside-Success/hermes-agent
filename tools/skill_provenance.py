@@ -76,3 +76,8 @@ def is_background_review() -> bool:
     """Convenience: True iff the current write origin is the background
     review fork."""
     return get_current_write_origin() == BACKGROUND_REVIEW
+
+
+# Share the existing provenance owner across native tool dispatch surfaces.
+# Bind once per execution, never on the shared foreground/review MemoryStore.
+native_memory_write_metadata = contextvars.ContextVar("native_memory_write_metadata", default=None)
