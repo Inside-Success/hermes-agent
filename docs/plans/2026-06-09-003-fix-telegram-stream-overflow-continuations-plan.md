@@ -1,4 +1,7 @@
 ---
+plan_id: "hermes-agent#2026"
+dependencies: []
+dependencies_reviewed: "2026-09-15"
 title: "fix: Prevent Telegram streamed replies from ending after first overflow chunk"
 status: active
 date: 2026-06-09

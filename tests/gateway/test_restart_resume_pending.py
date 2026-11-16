@@ -1937,3 +1937,139 @@ async def test_auto_resume_runs_agent_exactly_once_through_full_path():
     # No leaked sentinel and no orphaned queued event.
     assert session_key not in runner._running_agents
     assert session_key not in getattr(adapter, "_pending_messages", {})
+
+
+# ---------------------------------------------------------------------------
+# Startup marking after the previous process exited: re-run only the
+# conversations that were really cut off
+# ---------------------------------------------------------------------------
+
+
+class _SupervisorKill(BaseException):
+    """Stands in for the service manager killing the process mid-drain."""
+
+
+def _two_recent_sessions(tmp_path):
+    """A store with one conversation still mid-turn and one that already
+    finished. Both were updated seconds ago, i.e. inside the window the
+    startup sweep treats as "recently active"."""
+    store = SessionStore(sessions_dir=tmp_path / "sessions", config=GatewayConfig())
+    busy = store.get_or_create_session(make_restart_source(chat_id="busy"))
+    done = store.get_or_create_session(make_restart_source(chat_id="done"))
+    return store, busy.session_key, done.session_key
+
+
+def _entries_seen_by_next_process(tmp_path):
+    store = SessionStore(sessions_dir=tmp_path / "sessions", config=GatewayConfig())
+    with store._lock:
+        store._ensure_loaded_locked()
+        return store, dict(store._entries)
+
+
+async def _boot_next_process(tmp_path):
+    """Run the next gateway process's startup marking against the same
+    HERMES_HOME and session file, and return what it left on disk."""
+    store, _ = _entries_seen_by_next_process(tmp_path)
+    runner, _adapter = make_restart_runner()
+    runner.session_store = store
+    await runner._mark_sessions_interrupted_by_previous_run()
+    return _entries_seen_by_next_process(tmp_path)[1]
+
+
+@pytest.mark.asyncio
+async def test_restart_reruns_only_the_conversation_that_was_cut_off(tmp_path, monkeypatch):
+    """A service restart whose drain times out (the deployed drain is 0 s)
+    must not re-run a conversation that had already finished.
+
+    The shutdown path already marks every turn it interrupts. Before the
+    fix, the timed-out drain also suppressed the clean-shutdown marker, so
+    the next startup swept every session touched in the last 120 s into
+    resume_pending as well, and each finished thread got a stray reply.
+    """
+    monkeypatch.setattr("gateway.run._hermes_home", tmp_path)
+    store, busy_key, done_key = _two_recent_sessions(tmp_path)
+
+    runner, adapter = make_restart_runner()
+    adapter.disconnect = AsyncMock()
+    runner.session_store = store
+    runner._restart_drain_timeout = 0.05
+    runner._running_agents = {busy_key: MagicMock()}
+
+    with patch("gateway.status.remove_pid_file"), patch(
+        "gateway.status.write_runtime_status"
+    ):
+        await runner.stop(restart=True, detached_restart=False, service_restart=True)
+
+    entries = await _boot_next_process(tmp_path)
+
+    assert entries[busy_key].resume_pending is True
+    assert entries[busy_key].resume_reason == "restart_timeout"
+    assert entries[done_key].resume_pending is False
+
+
+@pytest.mark.asyncio
+async def test_kill_during_drain_still_reruns_only_the_cut_off_conversation(
+    tmp_path, monkeypatch
+):
+    """If the service manager kills the process during the drain, the
+    marks written before the drain (#27856) are the record of what was
+    running. The next startup must rely on them rather than sweeping every
+    recently active session."""
+    monkeypatch.setattr("gateway.run._hermes_home", tmp_path)
+    store, busy_key, done_key = _two_recent_sessions(tmp_path)
+
+    runner, adapter = make_restart_runner()
+    adapter.disconnect = AsyncMock()
+    runner.session_store = store
+    runner._running_agents = {busy_key: MagicMock()}
+
+    async def _killed_mid_drain(*_args, **_kwargs):
+        raise _SupervisorKill()
+
+    with patch("gateway.status.remove_pid_file"), patch(
+        "gateway.status.write_runtime_status"
+    ), patch.object(type(runner), "_drain_active_agents", _killed_mid_drain):
+        with pytest.raises(_SupervisorKill):
+            await runner.stop(restart=True, detached_restart=False, service_restart=True)
+
+    entries = await _boot_next_process(tmp_path)
+
+    assert entries[busy_key].resume_pending is True
+    assert entries[done_key].resume_pending is False
+
+
+@pytest.mark.asyncio
+async def test_crash_without_shutdown_still_recovers_recent_sessions(tmp_path, monkeypatch):
+    """Crash/OOM/SIGKILL with no shutdown at all leaves no record of which
+    turns were running, so startup keeps the recently-active sweep as the
+    safety net (crash recovery from #20888 is preserved)."""
+    monkeypatch.setattr("gateway.run._hermes_home", tmp_path)
+    _store, busy_key, done_key = _two_recent_sessions(tmp_path)
+
+    entries = await _boot_next_process(tmp_path)
+
+    for key in (busy_key, done_key):
+        assert entries[key].resume_pending is True
+        assert entries[key].resume_reason == "restart_interrupted"
+
+
+@pytest.mark.asyncio
+async def test_clean_shutdown_marks_nothing_on_startup(tmp_path, monkeypatch):
+    """A drain that finished leaves nothing to resume."""
+    monkeypatch.setattr("gateway.run._hermes_home", tmp_path)
+    store, busy_key, done_key = _two_recent_sessions(tmp_path)
+
+    runner, adapter = make_restart_runner()
+    adapter.disconnect = AsyncMock()
+    runner.session_store = store
+    runner._running_agents = {}
+
+    with patch("gateway.status.remove_pid_file"), patch(
+        "gateway.status.write_runtime_status"
+    ):
+        await runner.stop(restart=True, detached_restart=False, service_restart=True)
+
+    entries = await _boot_next_process(tmp_path)
+
+    assert entries[busy_key].resume_pending is False
+    assert entries[done_key].resume_pending is False

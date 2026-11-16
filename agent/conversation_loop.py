@@ -1028,6 +1028,9 @@ def run_conversation(
 
     # Main conversation loop counters (pure locals consumed by the loop below).
     api_call_count = 0
+    # Redirect/compression can refund logical API calls and restart the outer
+    # loop. Dispatch identities must remain unique for the entire turn.
+    api_attempt_count = 0
     final_response = None
     interrupted = False
     failed = False
@@ -1173,6 +1176,7 @@ def run_conversation(
         # iteration, no tools yet), the steer stays pending for the next
         # tool batch — injecting into a user message would break role
         # alternation, and there's no tool output to piggyback on.
+        _steered_tool_id = None
         _pre_api_steer = agent._drain_pending_steer()
         if _pre_api_steer:
             _injected = False
@@ -1181,7 +1185,9 @@ def run_conversation(
                 if isinstance(_sm, dict) and _sm.get("role") == "tool":
                     from agent.prompt_builder import format_steer_marker
                     marker = format_steer_marker(_pre_api_steer)
-                    existing = _sm.get("content", "")
+                    existing = _sm.pop("api_content", None)
+                    if existing is None:
+                        existing = _sm.get("content", "")
                     if isinstance(existing, str):
                         _sm["content"] = existing + marker
                     else:
@@ -1193,6 +1199,7 @@ def run_conversation(
                         except Exception:
                             pass
                     _injected = True
+                    _steered_tool_id = _sm.get("tool_call_id")
                     logger.debug(
                         "Pre-API-call steer drain: injected into tool msg at index %d",
                         _si,
@@ -1292,8 +1299,8 @@ def run_conversation(
                         api_msg["content"] = _composed
             elif (
                 isinstance(_api_content, str)
-                and _api_content
-                and msg.get("role") in ("user", "assistant")
+                and (_api_content or msg.get("role") == "tool")
+                and msg.get("role") in ("user", "assistant", "tool")
             ):
                 # Historical message: replay the exact bytes sent when it was
                 # live, so the provider prompt-cache prefix stays byte-stable
@@ -1506,6 +1513,24 @@ def run_conversation(
         # lone surrogates (U+D800-U+DFFF) that crash json.dumps() inside
         # the OpenAI SDK. Sanitizing here prevents the 3-retry cycle.
         _sanitize_messages_surrogates(api_messages)
+
+        # Budgets and progress flushes run before this final normalization.
+        # Capture the current turn's actual text input here, including late
+        # steer, while leaving untouched historical rows explicitly unknown.
+        # A historical tool modified by this iteration's steer is an exception:
+        # its newly sent view must replace its now-stale replay sidecar.
+        from agent.tool_executor import _persist_tool_api_content
+        _current_tool_ids = {
+            m.get("tool_call_id")
+            for m in messages[current_turn_user_idx + 1:]
+            if m.get("role") == "tool"
+        }
+        if _steered_tool_id:
+            _current_tool_ids.add(_steered_tool_id)
+        _persist_tool_api_content(agent, [
+            m for m in api_messages
+            if m.get("role") == "tool" and m.get("tool_call_id") in _current_tool_ids
+        ])
 
         # Apply Anthropic prompt caching for Claude models on native
         # Anthropic, OpenRouter, and third-party Anthropic-compatible
@@ -2052,17 +2077,126 @@ def run_conversation(
                         _use_streaming = False
 
                 def _perform_api_call(next_api_kwargs):
+                    nonlocal api_attempt_count
                     if agent.api_mode == "codex_responses":
                         next_api_kwargs = agent._get_transport().preflight_kwargs(
                             next_api_kwargs,
                             allow_stream=False,
                             is_github_responses=agent._is_copilot_url(),
                         )
-                    if _use_streaming:
-                        return agent._interruptible_streaming_api_call(
-                            next_api_kwargs, on_first_delta=_stop_spinner
-                        )
-                    return agent._interruptible_api_call(next_api_kwargs)
+                    # Retry recovery and execution middleware can transform
+                    # payloads after the initial API-message build. Backfill
+                    # from THIS attempt's final provider-shaped tool text.
+                    from agent.tool_executor import _persist_tool_api_content_from_request
+                    _persist_tool_api_content_from_request(agent, next_api_kwargs, _current_tool_ids)
+                    api_attempt_count += 1
+                    attempt_started = time.time()
+
+                    def attempt_selection(request):
+                        selected = getattr(agent, "turn_model_selection", None)
+                        if not selected:
+                            return None
+                        keys = ("reasoning", "reasoning_effort", "thinking")
+                        reasoning = {key: request[key] for key in keys if key in request}
+                        extra = request.get("extra_body")
+                        if isinstance(extra, dict):
+                            extra_reasoning = {key: extra[key] for key in keys if key in extra}
+                            if extra_reasoning:
+                                reasoning["extra_body"] = extra_reasoning
+                        return {**selected, "effective_model": request.get("model", agent.model),
+                                "effective_provider": agent.provider, "effective_reasoning": reasoning,
+                                "effective_service_tier": request.get("service_tier")}
+
+                    attempt_context = {
+                        "task_id": effective_task_id,
+                        "turn_id": turn_id,
+                        "api_request_id": api_request_id,
+                        "api_attempt_id": f"{api_request_id}:attempt:{api_attempt_count}",
+                        "session_id": agent.session_id or "",
+                        "platform": agent.platform or "",
+                        "model": next_api_kwargs.get("model", agent.model),
+                        "model_selection": attempt_selection(next_api_kwargs),
+                        "provider": agent.provider,
+                        "base_url": agent.base_url,
+                        "api_mode": agent.api_mode,
+                        "api_call_count": api_call_count,
+                        "started_at": attempt_started,
+                        # Raw, unbounded source payload. Observers must copy
+                        # and redact synchronously; retry recovery may mutate
+                        # this object. SDK-internal retries and transport-only
+                        # stream/timeout options are outside this boundary.
+                        "request": next_api_kwargs,
+                    }
+
+                    def observe_attempt(event, context=None, **payload):
+                        try:
+                            from hermes_cli.plugins import has_hook, invoke_hook
+                            if has_hook(event):
+                                invoke_hook(event, **(context or attempt_context), **payload)
+                        except Exception:
+                            logger.debug("Model attempt observer failed", exc_info=True)
+
+                    stream_observed = {"started": False, "closed": False}
+                    stream_lock = threading.Lock()
+                    stream_open = {}
+
+                    def observe_stream(event, *, number, request=None, started_at=None, **payload):
+                        context = dict(attempt_context)
+                        context["api_attempt_id"] = f"{attempt_context['api_attempt_id']}:stream:{number}"
+                        with stream_lock:
+                            if stream_observed["closed"]:
+                                return
+                            if event == "pre":
+                                stream_observed["started"] = True
+                                context["request"] = request
+                                context["model"] = request.get("model", agent.model)
+                                context["model_selection"] = attempt_selection(request)
+                                context["started_at"] = started_at
+                                stream_open[number] = context
+                                observe_attempt("pre_api_attempt", context=context)
+                            elif number in stream_open:
+                                context = stream_open.pop(number)
+                                observe_attempt("post_api_attempt", context=context, **payload)
+
+                    def close_unfinished_streams(error):
+                        with stream_lock:
+                            # Worker threads can unwind after this helper has
+                            # returned. Never accept a late pre/post pair.
+                            stream_observed["closed"] = True
+                            ended = time.time()
+                            for context in stream_open.values():
+                                observe_attempt("post_api_attempt", context=context, response=None,
+                                                error=error, ended_at=ended,
+                                                duration=ended - context["started_at"])
+                            stream_open.clear()
+
+                    if not _use_streaming:
+                        observe_attempt("pre_api_attempt")
+                    try:
+                        if _use_streaming:
+                            attempt_response = agent._interruptible_streaming_api_call(
+                                next_api_kwargs, on_first_delta=_stop_spinner,
+                                attempt_observer=observe_stream,
+                            )
+                        else:
+                            attempt_response = agent._interruptible_api_call(next_api_kwargs)
+                    except BaseException as exc:
+                        ended_at = time.time()
+                        close_unfinished_streams(exc)
+                        if not stream_observed["started"]:
+                            if _use_streaming:
+                                observe_attempt("pre_api_attempt")
+                            observe_attempt("post_api_attempt", response=None, error=exc,
+                                            ended_at=ended_at, duration=ended_at - attempt_started)
+                        raise
+                    ended_at = time.time()
+                    close_unfinished_streams(RuntimeError("stream observer ended before dispatch completed"))
+                    if not stream_observed["started"]:
+                        if _use_streaming:
+                            observe_attempt("pre_api_attempt")
+                        observe_attempt("post_api_attempt", response=attempt_response, error=None,
+                                        ended_at=ended_at, duration=ended_at - attempt_started)
+                    return attempt_response
 
                 from hermes_cli.middleware import run_llm_execution_middleware
 

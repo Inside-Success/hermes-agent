@@ -4703,6 +4703,21 @@ def _make_tool_handler(server_name: str, tool_name: str, tool_timeout: float):
             structured = getattr(result, "structuredContent", None)
             if structured is not None:
                 if text_result:
+                    # MCP servers commonly mirror their structured payload as
+                    # a JSON text block. Keep the original text byte-for-byte,
+                    # but do not charge the model's budget for a second copy.
+                    # Canonical JSON comparison preserves type distinctions
+                    # (Python equality would equate True and 1).
+                    try:
+                        duplicate = json.dumps(json.loads(text_result), sort_keys=True) == json.dumps(structured, sort_keys=True)
+                    except (ValueError, TypeError):
+                        duplicate = False
+                    if (
+                        duplicate
+                        and len(result.content or []) == 1
+                        and getattr(result.content[0], "type", None) == "text"
+                    ):
+                        return json.dumps({"result": text_result}, ensure_ascii=False)
                     return json.dumps({
                         "result": text_result,
                         "structuredContent": structured,

@@ -24,6 +24,7 @@ import sys
 import tempfile
 import threading
 import types
+from pathlib import Path
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from unittest.mock import MagicMock, patch
 
@@ -32,6 +33,11 @@ import pytest
 from agent.memory_manager import build_memory_context_block
 from agent.turn_context import build_turn_context, compose_user_api_content
 from hermes_state import SessionDB
+from tests.tools.test_mcp_structured_content import (
+    _FakeCallToolResult,
+    _FakeContentBlock,
+    _patch_mcp_server,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -453,6 +459,99 @@ def _text_resp(text: str) -> dict:
     }
 
 
+@pytest.mark.parametrize("late_steer", [False, True])
+def test_reloaded_tool_sidecar_reaches_actual_request(wire_env, late_steer):
+    make_agent, handler, db, sid = wire_env
+    db.create_session(sid, source="cli")
+    db.append_message(sid, "user", "question")
+    db.append_message(sid, "assistant", "", tool_calls=[{
+        "id": "call_1", "type": "function",
+        "function": {"name": "read_file", "arguments": "{}"},
+    }])
+    db.append_message(sid, "tool", "raw large result", tool_call_id="call_1", tool_name="read_file",
+                      api_content="actual post-budget result")
+    db.append_message(sid, "assistant", "prior answer")
+    agent = make_agent()
+    if late_steer:
+        agent.step_callback = lambda count, tools: agent.steer("check the evidence")
+    agent.run_conversation("continue", conversation_history=db.get_messages_as_conversation(sid))
+    request = next(r for r in handler.captured_requests if "messages" in r)
+    tools = [m for m in request["messages"] if m["role"] == "tool"]
+    assert len(tools) == 1
+    assert tools[0]["content"].startswith("actual post-budget result")
+    if late_steer:
+        assert "check the evidence" in tools[0]["content"]
+        row = next(r for r in db.get_messages(sid) if r["role"] == "tool")
+        assert row["api_content"] == tools[0]["content"]
+    else:
+        assert tools[0]["content"] == "actual post-budget result"
+    assert tools[0]["tool_call_id"] == "call_1"
+    assert "api_content" not in tools[0]
+
+
+def test_private_batch_preserves_all_evidence_on_wire(wire_env, _patch_mcp_server):
+    """Opt-in replay of redacted private evidence, never shipped in git."""
+    fixture = Path(__file__).parents[2] / ".scratch/tool-result-batch.json"
+    if not fixture.exists():
+        pytest.skip("private incident fixture is not installed")
+    from copy import deepcopy
+    from unittest.mock import AsyncMock
+    from agent.tool_dispatch_helpers import make_tool_result_message
+    from agent.tool_executor import execute_tool_calls_segmented
+    from tools.tool_result_storage import enforce_turn_budget
+    from tools.mcp_tool import _make_tool_handler
+
+    original = json.loads(fixture.read_text())
+    assert len(original) > 1
+    before = deepcopy(original)
+    enforce_turn_budget(before, env=None)
+    # The unchanged old budget code still demonstrates the incident on the
+    # original duplicated payload, so this is not a hand-authored substitute.
+    assert any(a["content"] != b["content"] for a, b in zip(before, original))
+
+    make_agent, handler, db, sid = wire_env
+    agent = make_agent()
+    db.create_session(sid, source="cli")
+    db.append_message(sid, "user", "read evidence")
+    calls = [{"id": row["tool_call_id"], "type": "function", "function": {
+        "name": row["tool_name"], "arguments": "{}"}} for row in original]
+    db.append_message(sid, "assistant", "", tool_calls=calls)
+    messages = []
+    for row in original:
+        content = row["content"]
+        payload = json.loads(content[content.index("{"):content.rindex("}") + 1])
+        text_result = payload["result"]
+        _patch_mcp_server.call_tool = AsyncMock(return_value=_FakeCallToolResult(
+            content=[_FakeContentBlock(text_result)] if isinstance(text_result, str) else [],
+            structuredContent=payload.get("structuredContent") if isinstance(text_result, str) else text_result,
+        ))
+        adapted = _make_tool_handler("test-server", "incident-tool", 30)({})
+        rendered = json.loads(adapted)
+        # Every character of model-oriented evidence survives, including every
+        # dated quote, qualification, source version and confidence field.
+        assert rendered["result"] == payload["result"]
+        if "structuredContent" in payload:
+            assert rendered.get("structuredContent", json.loads(rendered["result"])) == payload["structuredContent"]
+        msg = make_tool_result_message(row["tool_name"], adapted, row["tool_call_id"])
+        messages.append(msg)
+        db.append_message(sid, "tool", content, tool_call_id=row["tool_call_id"], tool_name=row["tool_name"])
+
+    expected = [m["content"] for m in messages]
+    assert sum(map(len, expected)) < 200000
+    with patch("agent.tool_executor.get_active_env", return_value=None):
+        execute_tool_calls_segmented(agent, types.SimpleNamespace(tool_calls=calls), messages, "t", segments=[])
+    assert [m["content"] for m in messages] == expected
+    rows = [r for r in db.get_messages(sid) if r["role"] == "tool"]
+    assert [r["content"] for r in rows] == [r["content"] for r in original]
+    assert [r["api_content"] for r in rows] == expected
+    db.append_message(sid, "assistant", "evidence received")
+    agent.run_conversation("continue", conversation_history=db.get_messages_as_conversation(sid))
+    request = _chat_requests(handler)[-1]
+    sent = [m for m in request["messages"] if m["role"] == "tool"]
+    assert [m["content"] for m in sent] == expected
+    assert [m["tool_call_id"] for m in sent] == [r["tool_call_id"] for r in original]
+
+
 @pytest.fixture()
 def wire_env():
     """Mock provider + isolated HERMES_HOME + a shared SessionDB.
@@ -521,6 +620,290 @@ def _user_messages(req: dict) -> list:
 
 
 class TestWireInvariant:
+    def test_cancelled_helper_rejects_late_worker_observations(self, wire_env):
+        make_agent, _, _, _ = wire_env
+        agent = make_agent()
+        agent.stream_delta_callback = lambda text: None
+        release = threading.Event()
+        finished = threading.Event()
+        attempts = []
+
+        def fake_stream(kwargs, *, on_first_delta=None, attempt_observer=None):
+            def late_worker():
+                release.wait(5)
+                attempt_observer("pre", number=1, request=kwargs, started_at=0.0)
+                attempt_observer("post", number=1, response=None,
+                                 error=RuntimeError("late"), duration=0.0)
+                finished.set()
+            threading.Thread(target=late_worker, daemon=True).start()
+            agent._interrupt_requested = True
+            raise InterruptedError("synthetic cancellation")
+
+        def capture(event, **payload):
+            if event in {"pre_api_attempt", "post_api_attempt"}:
+                attempts.append((event, payload["api_attempt_id"]))
+            return []
+
+        try:
+            with patch.object(agent, "_interruptible_streaming_api_call", side_effect=fake_stream), \
+                 patch("hermes_cli.plugins.has_hook", side_effect=lambda event: event in {"pre_api_attempt", "post_api_attempt"}), \
+                 patch("hermes_cli.plugins.invoke_hook", side_effect=capture):
+                agent.run_conversation("read evidence", conversation_history=[], task_id="t")
+                before = list(attempts)
+                release.set()
+                assert finished.wait(5)
+                assert attempts == before
+                assert [event for event, _ in attempts] == ["pre_api_attempt", "post_api_attempt"]
+                assert attempts[0][1] == attempts[1][1]
+        finally:
+            release.set()
+
+    def test_partial_stream_error_keeps_content_and_reasoning_in_export(self, wire_env, monkeypatch):
+        import importlib
+        import httpx
+        from types import SimpleNamespace
+        langfuse = pytest.importorskip("langfuse")
+        from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
+
+        make_agent, handler, _, _ = wire_env
+        agent = make_agent()
+        agent.stream_delta_callback = lambda text: None
+        handler.response_queue.append(_text_resp("done"))
+        original_create = agent._create_request_openai_client
+        dispatches = []
+
+        def failed_stream():
+            delta = SimpleNamespace(content="partial answer", reasoning_content="partial reasoning",
+                                    reasoning=None, tool_calls=None)
+            yield SimpleNamespace(choices=[SimpleNamespace(delta=delta, finish_reason=None)],
+                                  model="test-model", usage=None)
+            raise httpx.RemoteProtocolError("synthetic partial stream failure")
+
+        def client_for_attempt(*args, **kwargs):
+            dispatches.append(1)
+            if len(dispatches) == 1:
+                fake = MagicMock()
+                fake.chat.completions.create.return_value = failed_stream()
+                return fake
+            return original_create(*args, **kwargs)
+
+        plugin = importlib.import_module("plugins.observability.langfuse")
+        exporter = InMemorySpanExporter()
+        client = langfuse.Langfuse(public_key="pk-lf-test-stream-partial", secret_key="sk-lf-test",
+                                  span_exporter=exporter, sample_rate=1.0)
+        monkeypatch.setattr(plugin, "_FULL_CONTENT", True)
+        monkeypatch.setattr(plugin, "_get_langfuse", lambda: client)
+        monkeypatch.setattr(plugin, "propagate_attributes", None)
+        hooks = {"pre_api_attempt": plugin.on_pre_api_attempt,
+                 "post_api_attempt": plugin.on_post_api_attempt,
+                 "post_llm_call": plugin.on_post_llm_call}
+
+        def invoke(event, **payload):
+            if event in hooks:
+                hooks[event](**payload)
+            return []
+
+        try:
+            with patch.object(agent, "_create_request_openai_client", side_effect=client_for_attempt), \
+                 patch("hermes_cli.plugins.has_hook", side_effect=lambda event: event in hooks), \
+                 patch("hermes_cli.plugins.invoke_hook", side_effect=invoke):
+                agent.run_conversation("read evidence", conversation_history=[], task_id="t")
+            client.flush()
+            generations = [s for s in exporter.get_finished_spans() if s.name.startswith("LLM attempt ")]
+            errors = [s for s in generations if s.attributes.get("langfuse.observation.metadata.status") == "error"]
+            assert errors
+            output = json.loads(errors[0].attributes["langfuse.observation.output"])
+            assert output["partial"]["content"] == "partial answer"
+            assert output["partial"]["reasoning"] == "partial reasoning"
+            assert "synthetic partial stream failure" in output["error"]["message"]
+        finally:
+            client.shutdown()
+
+    def test_stream_retries_create_one_exported_generation_per_dispatch(self, wire_env, monkeypatch):
+        import importlib
+        import httpx
+        langfuse = pytest.importorskip("langfuse")
+        from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
+
+        make_agent, handler, _, _ = wire_env
+        agent = make_agent()
+        agent.turn_model_selection = {"policy_revision": "test-policy", "selected_model": "policy-target"}
+        agent.stream_delta_callback = lambda text: None
+        handler.response_queue.append(_text_resp("done"))
+        original_create = agent._create_request_openai_client
+        dispatches = []
+
+        def client_for_attempt(*args, **kwargs):
+            dispatches.append(1)
+            if len(dispatches) <= 2:
+                fake = MagicMock()
+                fake.chat.completions.create.side_effect = httpx.RemoteProtocolError("synthetic connection drop")
+                return fake
+            return original_create(*args, **kwargs)
+
+        plugin = importlib.import_module("plugins.observability.langfuse")
+        exporter = InMemorySpanExporter()
+        client = langfuse.Langfuse(public_key="pk-lf-test-stream-retries", secret_key="sk-lf-test",
+                                  span_exporter=exporter, sample_rate=1.0)
+        monkeypatch.setattr(plugin, "_FULL_CONTENT", True)
+        monkeypatch.setattr(plugin, "_get_langfuse", lambda: client)
+        monkeypatch.setattr(plugin, "propagate_attributes", None)
+        monkeypatch.setenv("HERMES_STREAM_RETRIES", "2")
+        hooks = {"pre_api_attempt": plugin.on_pre_api_attempt,
+                 "post_api_attempt": plugin.on_post_api_attempt,
+                 "post_llm_call": plugin.on_post_llm_call}
+
+        def invoke(event, **payload):
+            if event in hooks:
+                hooks[event](**payload)
+            return []
+
+        try:
+            with patch.object(agent, "_create_request_openai_client", side_effect=client_for_attempt), \
+                 patch("hermes_cli.plugins.has_hook", side_effect=lambda event: event in hooks), \
+                 patch("hermes_cli.plugins.invoke_hook", side_effect=invoke):
+                agent.run_conversation("read evidence", conversation_history=[], task_id="t")
+            client.flush()
+            generations = [span for span in exporter.get_finished_spans() if span.name.startswith("LLM attempt ")]
+            assert len(dispatches) == 3
+            assert len(generations) == 3
+            assert len({s.name for s in generations}) == 3
+            assert sorted(s.attributes["langfuse.observation.metadata.status"] for s in generations) == ["error", "error", "success"]
+            assert all(json.loads(s.attributes["langfuse.observation.input"])["stream"] for s in generations)
+            for span in generations:
+                request = json.loads(span.attributes["langfuse.observation.input"])
+                receipt = json.loads(span.attributes["langfuse.observation.metadata.model_selection"])
+                assert receipt["selected_model"] == "policy-target"
+                assert receipt["effective_model"] == request["model"]
+        finally:
+            client.shutdown()
+
+    def test_redirect_restart_keeps_dispatch_attempt_ids_unique(self, wire_env):
+        make_agent, handler, db, sid = wire_env
+        agent = make_agent()
+        handler.response_queue.append(_text_resp("done"))
+        original_call = agent._interruptible_streaming_api_call
+        redirected = []
+        attempts = []
+
+        def capture_attempt(event, **payload):
+            if event in {"pre_api_attempt", "post_api_attempt"}:
+                attempts.append((event, dict(payload)))
+            return []
+
+        def redirect_once(kwargs, **options):
+            if not redirected:
+                redirected.append(True)
+                agent.redirect("Use corrected question")
+                raise InterruptedError("request cancelled for redirect")
+            return original_call(kwargs, **options)
+
+        with patch.object(agent, "_interruptible_streaming_api_call", side_effect=redirect_once), \
+             patch("hermes_cli.plugins.has_hook", side_effect=lambda event: event in {"pre_api_attempt", "post_api_attempt"}), \
+             patch("hermes_cli.plugins.invoke_hook", side_effect=capture_attempt):
+            agent.run_conversation("original question", conversation_history=[], task_id="t")
+        before = [p for event, p in attempts if event == "pre_api_attempt"]
+        after = [p for event, p in attempts if event == "post_api_attempt"]
+        assert len(before) == len(after) == 2
+        assert before[0]["api_request_id"] == before[1]["api_request_id"]
+        assert len({p["api_attempt_id"] for p in before}) == 2
+        assert [p["api_attempt_id"] for p in before] == [p["api_attempt_id"] for p in after]
+        assert isinstance(after[0]["error"], InterruptedError)
+        assert after[1]["error"] is None
+        assert after[1]["response"] is not None
+
+    def test_retry_sidecar_matches_ascii_fallback_request(self, wire_env):
+        from copy import deepcopy
+        make_agent, handler, db, sid = wire_env
+        agent = make_agent()
+        agent.valid_tool_names = {"search_files"}
+        raw = "Café evidence"
+        handler.response_queue.extend([_tc_resp("search_files"), _text_resp("done")])
+        original_call = agent._interruptible_streaming_api_call
+        failures = []
+        attempts = []
+
+        def capture_attempt(event, **payload):
+            if event in {"pre_api_attempt", "post_api_attempt"}:
+                snapshot = dict(payload)
+                snapshot["request"] = deepcopy(payload["request"])
+                attempts.append((event, snapshot))
+            return []
+
+        def fail_once_with_tool(kwargs, **options):
+            if not failures and any(m.get("role") == "tool" for m in kwargs.get("messages", [])):
+                failures.append(True)
+                raise UnicodeEncodeError("ascii", raw, 3, 4, "test encoding failure")
+            return original_call(kwargs, **options)
+
+        with patch("run_agent.handle_function_call", return_value=raw), \
+             patch.object(agent, "_invoke_tool", return_value=raw), \
+             patch.object(agent, "_interruptible_streaming_api_call", side_effect=fail_once_with_tool), \
+             patch("hermes_cli.plugins.has_hook", side_effect=lambda event: event in {"pre_api_attempt", "post_api_attempt"}), \
+             patch("hermes_cli.plugins.invoke_hook", side_effect=capture_attempt):
+            agent.run_conversation("read evidence", conversation_history=[], task_id="t")
+        assert len(failures) == 1
+        request = _chat_requests(handler)[-1]
+        sent = next(m for m in request["messages"] if m["role"] == "tool")["content"]
+        assert sent == "Caf evidence"
+        row = next(r for r in db.get_messages(sid) if r["role"] == "tool")
+        assert row["content"] == raw
+        assert row["api_content"] == sent
+        before = [p for event, p in attempts if event == "pre_api_attempt"]
+        after = [p for event, p in attempts if event == "post_api_attempt"]
+        assert len(before) == len(after) == 3
+        assert len({p["api_attempt_id"] for p in before}) == 3
+        assert [p["api_attempt_id"] for p in before] == [p["api_attempt_id"] for p in after]
+        assert isinstance(after[1]["error"], UnicodeEncodeError)
+        assert after[1]["response"] is None
+        assert after[2]["error"] is None
+        assert after[2]["response"] is not None
+        failed_tool = next(m for m in before[1]["request"]["messages"] if m["role"] == "tool")
+        retried_tool = next(m for m in before[2]["request"]["messages"] if m["role"] == "tool")
+        assert failed_tool["content"] == raw
+        assert retried_tool["content"] == sent
+
+    @pytest.mark.parametrize("late_steer", [False, True])
+    def test_tool_sidecar_matches_final_normalized_request(self, wire_env, late_steer):
+        make_agent, handler, db, sid = wire_env
+        agent = make_agent()
+        agent.valid_tool_names = {"search_files"}
+        raw = "  evidence with whitespace\n"
+        if late_steer:
+            agent.step_callback = lambda count, tools: agent.steer("check qualifiers") if count == 1 else None
+        handler.response_queue.extend([_tc_resp("search_files"), _text_resp("done")])
+        with patch("run_agent.handle_function_call", return_value=raw), \
+             patch.object(agent, "_invoke_tool", return_value=raw):
+            agent.run_conversation("read evidence", conversation_history=[], task_id="t")
+        requests = _chat_requests(handler)
+        sent = next(m for m in requests[1]["messages"] if m["role"] == "tool")["content"]
+        if late_steer:
+            assert "check qualifiers" in sent
+        assert sent == sent.strip()
+        row = next(r for r in db.get_messages(sid) if r["role"] == "tool")
+        assert row["content"] == raw
+        assert row["api_content"] == sent
+
+    def test_per_result_budget_retains_raw_and_records_actual_request(self, wire_env):
+        make_agent, handler, db, sid = wire_env
+        agent = make_agent()
+        raw = "complete evidence\n" * 8000
+        agent.valid_tool_names = {"search_files"}
+        handler.response_queue.extend([_tc_resp("search_files"), _text_resp("done")])
+        with patch.object(agent, "_invoke_tool", return_value=raw), \
+             patch("run_agent.handle_function_call", return_value=raw), \
+             patch("agent.tool_executor.get_active_env", return_value=None):
+            agent.run_conversation("read evidence", conversation_history=[], task_id="t")
+        requests = _chat_requests(handler)
+        assert len(requests) == 2
+        tools = [m for m in requests[1]["messages"] if m["role"] == "tool"]
+        assert len(tools) == 1
+        assert len(tools[0]["content"]) < len(raw)
+        rows = [r for r in db.get_messages(sid) if r["role"] == "tool"]
+        assert len(rows) == 1
+        assert rows[0]["content"] == raw
+        assert rows[0]["api_content"] == tools[0]["content"]
+
     def test_injection_sent_stamped_and_stable_within_turn(self, wire_env):
         """The current turn's user message goes out with the injected context,
         the sidecar equals the sent bytes exactly, the field never reaches the

@@ -2291,7 +2291,7 @@ def _build_partial_stream_stub(
     )
 
 
-def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=None):
+def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=None, attempt_observer=None):
     """Streaming variant of _interruptible_api_call for real-time token delivery.
 
     Handles all three api_modes:
@@ -2512,6 +2512,40 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
         return result["response"]
 
     result = {"response": None, "error": None, "partial_tool_names": []}
+    observed_attempt = {"number": 0, "started": False, "started_at": 0.0,
+                        "content": [], "reasoning": [], "tool_calls": {}}
+
+    def _observe_dispatch(event, **payload):
+        if attempt_observer is not None:
+            try:
+                attempt_observer(event, **payload)
+            except Exception:
+                logger.debug("stream dispatch observer failed", exc_info=True)
+
+    def _observe_start(request):
+        # Client creation may have blocked while the caller cancelled the
+        # request. Do not dispatch or create a late observation afterwards.
+        if agent._interrupt_requested or _request_cancelled["value"]:
+            raise InterruptedError("Agent interrupted before streaming dispatch")
+        observed_attempt["started"] = True
+        observed_attempt["started_at"] = time.time()
+        _observe_dispatch("pre", number=observed_attempt["number"], request=request,
+                          started_at=observed_attempt["started_at"])
+
+    def _observe_end(response=None, error=None):
+        if not observed_attempt["started"]:
+            return
+        observed_attempt["started"] = False
+        ended = time.time()
+        partial = None
+        if error is not None:
+            partial = {"content": "".join(observed_attempt["content"]),
+                       "reasoning": "".join(observed_attempt["reasoning"]),
+                       "tool_calls": [{"index": str(index), "value": value}
+                                      for index, value in observed_attempt["tool_calls"].items()]}
+        _observe_dispatch("post", number=observed_attempt["number"], response=response,
+                          error=error, partial=partial, ended_at=ended,
+                          duration=ended - observed_attempt["started_at"])
 
     # Cross-turn stale-stream circuit breaker (#58962) — see the canonical
     # comment block above ``_stale_streak()``.  Raises past the give-up
@@ -2787,6 +2821,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
         # ``request_client_holder["diag"]`` for closure access.
         _diag = agent._stream_diag_init()
         request_client_holder["diag"] = _diag
+        _observe_start(stream_kwargs)
         stream = request_client.chat.completions.create(**stream_kwargs)
         if agent.provider == "moa":
             # The MoA facade is a shared singleton — abort/close of the
@@ -2857,6 +2892,8 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
 
         content_parts: list = []
         tool_calls_acc: dict = {}
+        observed_attempt["content"] = content_parts
+        observed_attempt["tool_calls"] = tool_calls_acc
         tool_gen_notified: set = set()
         # Ollama-compatible endpoints reuse index 0 for every tool call
         # in a parallel batch, distinguishing them only by id.  Track
@@ -2868,6 +2905,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
         model_name = None
         role = "assistant"
         reasoning_parts: list = []
+        observed_attempt["reasoning"] = reasoning_parts
         usage_obj = None
         for chunk in stream:
             # Stop the moment a newer attempt has claimed the delta sink
@@ -3215,6 +3253,7 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
             api_kwargs, log_prefix=getattr(agent, "log_prefix", "")
         )
         # Use the Anthropic SDK's streaming context manager
+        _observe_start(api_kwargs)
         with request_client.messages.stream(**api_kwargs) as stream:
             # The Anthropic SDK exposes the raw httpx response on
             # ``stream.response``.  Snapshot diagnostic headers
@@ -3272,6 +3311,8 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                     if block and getattr(block, "type", None) == "tool_use":
                         has_tool_use = True
                         tool_name = getattr(block, "name", None)
+                        observed_attempt["tool_calls"][str(getattr(event, "index", 0))] = {
+                            "name": tool_name, "partial_json": ""}
                         if tool_name:
                             _fire_first_delta()
                             agent._fire_tool_gen_started(tool_name)
@@ -3282,6 +3323,8 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                         delta_type = getattr(delta, "type", None)
                         if delta_type == "text_delta":
                             text = getattr(delta, "text", "")
+                            if text:
+                                observed_attempt["content"].append(text)
                             if text and not has_tool_use:
                                 _fire_first_delta()
                                 agent._fire_stream_delta(text)
@@ -3289,8 +3332,13 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                         elif delta_type == "thinking_delta":
                             thinking_text = getattr(delta, "thinking", "")
                             if thinking_text:
+                                observed_attempt["reasoning"].append(thinking_text)
                                 _fire_first_delta()
                                 agent._fire_reasoning_delta(thinking_text)
+                        elif delta_type == "input_json_delta":
+                            tool = observed_attempt["tool_calls"].setdefault(
+                                str(getattr(event, "index", 0)), {"partial_json": ""})
+                            tool["partial_json"] += getattr(delta, "partial_json", "") or ""
 
             # Return the native Anthropic Message for downstream processing.
             # If the stream was interrupted (the event loop broke out above on
@@ -3341,6 +3389,8 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
 
         try:
             for _stream_attempt in range(_max_stream_retries + 1):
+                observed_attempt.update(number=_stream_attempt + 1, started=False,
+                                        content=[], reasoning=[], tool_calls={})
                 stream_attempt_id = _start_stream_attempt()
                 # Check for interrupt before each retry attempt.  Without
                 # this, /stop closes the HTTP connection (outer poll loop),
@@ -3365,8 +3415,17 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
                         result["response"] = _call_anthropic(request_client)
                     else:
                         result["response"] = _call_chat_completions(stream_attempt_id)
+                    if agent._interrupt_requested or _request_cancelled["value"]:
+                        _observe_end(response=result["response"],
+                                     error=InterruptedError("Agent interrupted during streaming dispatch"))
+                    elif getattr(result["response"], "id", None) == PARTIAL_STREAM_STUB_ID:
+                        _observe_end(response=result["response"],
+                                     error=RuntimeError("provider returned incomplete streamed output"))
+                    else:
+                        _observe_end(response=result["response"])
                     return  # success
                 except Exception as e:
+                    _observe_end(error=e)
                     # If the main poll loop force-closed this request because
                     # of an interrupt, the resulting transport error is the
                     # expected consequence of our own close — NOT a transient

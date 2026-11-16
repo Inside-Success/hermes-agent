@@ -2349,6 +2349,11 @@ DEFAULT_CONFIG = {
         "engine": "compressor",
     },
 
+    # Complete Langfuse content capture is an explicit per-profile opt-in.
+    "plugins": {
+        "entries": {"observability/langfuse": {"full_content": False}},
+    },
+
     # Persistent memory -- bounded curated memory injected into system prompt
     "memory": {
         "memory_enabled": True,

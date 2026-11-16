@@ -54,9 +54,10 @@ class TestManifest:
         data = yaml.safe_load((PLUGIN_DIR / "plugin.yaml").read_text())
         assert data["name"] == "langfuse"
         assert data["version"]
-        # All six hooks the plugin implements.
+        # Includes opt-in complete per-dispatch hooks as well as previews.
         assert set(data["hooks"]) == {
             "pre_api_request", "post_api_request",
+            "pre_api_attempt", "post_api_attempt",
             "pre_llm_call", "post_llm_call",
             "pre_tool_call", "post_tool_call",
         }
