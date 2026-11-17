@@ -16,6 +16,7 @@ sites unchanged.  Symbols that tests patch on ``run_agent`` (e.g.
 from __future__ import annotations
 
 import json
+from contextvars import copy_context
 import logging
 import math
 import os
@@ -755,7 +756,8 @@ def interruptible_api_call(agent, api_kwargs: dict):
     _call_start = time.time()
     agent._touch_activity("waiting for non-streaming API response")
 
-    t = threading.Thread(target=_call, daemon=True)
+    context = copy_context()
+    t = threading.Thread(target=context.run, args=(_call,), daemon=True)
     t.start()
     _poll_count = 0
     while t.is_alive():
@@ -3776,7 +3778,8 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
         if _reasoning_floor is not None:
             _stream_stale_timeout = max(_stream_stale_timeout, _reasoning_floor)
 
-    t = threading.Thread(target=_call, daemon=True)
+    context = copy_context()
+    t = threading.Thread(target=context.run, args=(_call,), daemon=True)
     t.start()
     _last_heartbeat = time.time()
     _HEARTBEAT_INTERVAL = 30.0  # seconds between gateway activity touches
