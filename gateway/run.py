@@ -13078,6 +13078,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # (staged below, consumed in run_sync → build_turn_context).
         turn_sidecar_notes: List[str] = []
 
+        # Inside Success patch, 2026-11-19: the Slack thread id is left out of
+        # the cached system prompt (gateway/session.py) and rides the user
+        # message here, so new conversations reuse the provider prompt cache.
+        try:
+            from gateway.session import _slack_thread_rides_user_message
+            if _slack_thread_rides_user_message(source):
+                turn_sidecar_notes.append(
+                    f"[Slack thread: {source.thread_id} in channel {source.chat_id}]"
+                )
+        except Exception:
+            pass
+
         # If the previous session expired and was auto-reset, deliver a notice
         # so the agent knows this is a fresh conversation (not an intentional /reset).
         if _was_auto_reset:
