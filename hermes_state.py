@@ -725,27 +725,119 @@ def _claim_repair_attempt(db_path: Path) -> bool:
         return True
 
 
-def _backup_db_file(db_path: Path) -> Optional[Path]:
-    """Copy a (possibly malformed) DB file to a timestamped backup beside it.
+# ---------------------------------------------------------------------------
+# Sole access for automatic repair
+# ---------------------------------------------------------------------------
+# One profile state.db is open in several processes at once: the gateway, the
+# dashboard, and every TUI / cron child spawned for an agent turn. Repairing it
+# (FTS 'rebuild', REINDEX, sqlite_master surgery, VACUUM) while any of them
+# still has it open is a documented SQLite corruption recipe, and so is closing
+# a raw file descriptor on the database inside a process that has a SQLite
+# connection to it: POSIX drops every lock that process holds on the file. A
+# repair run in whichever process hit the error first, under live connections
+# and after a raw shutil.copy2 backup, is the likely way one bad FTS index
+# became a physically corrupt database on a multi-process host.
+#
+# So automatic repair runs only on ONE connection that first proves it is
+# alone: ``PRAGMA locking_mode=EXCLUSIVE`` then ``BEGIN EXCLUSIVE``. In WAL
+# mode every connection that has read the database holds a SHARED lock on the
+# file until it closes, so the EXCLUSIVE lock is granted only when no other
+# connection, in this process or any other, has the database open. Once
+# granted it is held until the guard connection closes, so nobody can open the
+# database mid-repair, and every repair step, the health probe and the backup
+# run on that one connection. In rollback-journal mode an idle connection holds
+# no lock, so there the guard proves only that nobody is inside a transaction;
+# it still keeps everyone out until the repair is done.
+#
+# When sole access cannot be proven nothing is changed: one ERROR carrying
+# STATE_DB_OFFLINE_REPAIR_MARKER says the offline repair is needed.
+STATE_DB_OFFLINE_REPAIR_MARKER = "STATE_DB_OFFLINE_REPAIR_NEEDED"
+_SOLE_ACCESS_TIMEOUT_S = 1.0
 
-    Raw file copy on purpose: the DB won't open cleanly, so we preserve the
-    bytes exactly for forensics / manual restore. WAL and SHM sidecars are
-    copied too when present. Returns the backup path, or None on failure.
+
+class StateDBRepairRefused(RuntimeError):
+    """Automatic repair was refused: another connection may hold the database."""
+
+
+def _is_lock_contention(reason: str) -> bool:
+    text = reason.lower()
+    return "locked" in text or "busy" in text
+
+
+def _open_sole_access(db_path: Path) -> Tuple[Optional[sqlite3.Connection], str]:
+    """Return ``(connection, "")`` holding *db_path* exclusively, or ``(None, reason)``.
+
+    The connection keeps the EXCLUSIVE lock until it is closed; the caller
+    must close it. A refusal leaves no lock behind (the connection is closed).
+    """
+    try:
+        conn = sqlite3.connect(
+            str(db_path),
+            isolation_level=None,
+            timeout=_SOLE_ACCESS_TIMEOUT_S,
+            check_same_thread=False,
+        )
+    except sqlite3.Error as exc:
+        return None, str(exc)
+    try:
+        conn.execute("PRAGMA locking_mode=EXCLUSIVE")
+        # Takes the lock without parsing the schema, so it also works on the
+        # malformed-schema class where every other statement fails.
+        conn.execute("BEGIN EXCLUSIVE")
+        conn.execute("COMMIT")
+    except sqlite3.Error as exc:
+        conn.close()
+        return None, str(exc)
+    return conn, ""
+
+
+def _repair_not_started(problem: str, reason: str) -> str:
+    """Describe an automatic repair that changed nothing, for _offline_repair_needed."""
+    if _is_lock_contention(reason):
+        return (
+            f"{problem}, and automatic repair was refused: another connection "
+            f"or process has the database open ({reason}), and repairing a live "
+            "SQLite file can corrupt it further. Nothing was changed."
+        )
+    return f"{problem}, and automatic repair could not start ({reason}). Nothing was changed."
+
+
+def _offline_repair_needed(db_path: Path, what_happened: str) -> str:
+    """Log the one ERROR saying the offline repair is needed; return its text."""
+    message = (
+        f"{STATE_DB_OFFLINE_REPAIR_MARKER}: {db_path} {what_happened} Stop every "
+        "Hermes process using this profile (gateway, dashboard, agent and cron "
+        "runs), then run `hermes sessions repair`, or restore from a backup."
+    )
+    logger.error(message)
+    return message
+
+
+def _backup_db_online(conn: sqlite3.Connection, db_path: Path) -> Optional[Path]:
+    """Copy the database beside itself through SQLite's online backup API.
+
+    *conn* must hold the database exclusively (``_open_sole_access``). The
+    copy is read through SQLite, so it is consistent and self-contained (WAL
+    content included), and the database file is never opened with a raw file
+    descriptor, whose close() would drop this process's locks on it. Pages are
+    copied as stored, so a corrupt page is preserved for forensics. Returns
+    the backup path, or None on failure (a partial copy is removed).
     """
     import datetime
-    import shutil
 
     stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     backup_path = db_path.with_name(f"{db_path.name}.malformed-backup-{stamp}")
     try:
-        shutil.copy2(db_path, backup_path)
-        for suffix in ("-wal", "-shm"):
-            sidecar = db_path.with_name(db_path.name + suffix)
-            if sidecar.exists():
-                shutil.copy2(sidecar, backup_path.with_name(backup_path.name + suffix))
+        target = sqlite3.connect(str(backup_path))
+        try:
+            conn.backup(target)
+        finally:
+            target.close()
         return backup_path
-    except Exception as exc:  # pragma: no cover - best effort
+    except Exception as exc:
         logger.warning("Could not back up malformed DB %s: %s", db_path, exc)
+        with contextlib.suppress(OSError):
+            backup_path.unlink()
         return None
 
 
@@ -761,6 +853,18 @@ def _db_opens_cleanly(db_path: Path) -> Optional[str]:
     past as a false "ok" (#50502).
     """
     conn = sqlite3.connect(str(db_path), isolation_level=None)
+    try:
+        return _connection_health(conn)
+    finally:
+        conn.close()
+
+
+def _connection_health(conn: sqlite3.Connection) -> Optional[str]:
+    """The ``_db_opens_cleanly`` probe on an open connection (None if healthy).
+
+    The repair path runs it on its sole-access connection, which holds the
+    database exclusively, so no second connection is opened mid-repair.
+    """
     try:
         # Best-effort tokenizer load: a DB carrying the messages_fts_cjk
         # index needs the cjk_unicode61 extension before any statement can
@@ -871,8 +975,6 @@ def _db_opens_cleanly(db_path: Path) -> Optional[str]:
         return None
     except sqlite3.DatabaseError as exc:
         return str(exc)
-    finally:
-        conn.close()
 
 
 def repair_state_db_schema(db_path: Path, *, backup: bool = True) -> Dict[str, Any]:
@@ -896,17 +998,25 @@ def repair_state_db_schema(db_path: Path, *, backup: bool = True) -> Dict[str, A
          The next ``SessionDB()`` open rebuilds the FTS indexes from the
          canonical ``messages`` table.
 
+    Runs only with sole access (``_open_sole_access``): every step, the
+    health probe and the backup run on one connection that holds the
+    database exclusively. If any other connection or process has the
+    database open, nothing is changed, ``refused`` is True and one ERROR
+    says the offline repair is needed.
+
     Canonical ``sessions`` / ``messages`` rows are never modified. A
-    timestamped raw backup is taken first unless ``backup=False``.
+    timestamped backup is taken first through SQLite's online backup API
+    unless ``backup=False``; if that backup fails, nothing is changed.
 
     Returns a report dict: ``{repaired: bool, strategy: str|None,
-    backup_path: str|None, error: str|None}``.
+    backup_path: str|None, error: str|None, refused: bool}``.
     """
     report: Dict[str, Any] = {
         "repaired": False,
         "strategy": None,
         "backup_path": None,
         "error": None,
+        "refused": False,
     }
 
     db_path = Path(db_path)
@@ -914,39 +1024,57 @@ def repair_state_db_schema(db_path: Path, *, backup: bool = True) -> Dict[str, A
         report["error"] = f"{db_path} does not exist"
         return report
 
-    if _db_opens_cleanly(db_path) is None:
+    conn, reason = _open_sole_access(db_path)
+    if conn is None:
+        report["refused"] = _is_lock_contention(reason)
+        report["error"] = _offline_repair_needed(db_path, _repair_not_started(
+            "does not open cleanly", reason
+        ))
+        return report
+    try:
+        return _repair_with_sole_access(conn, db_path, backup=backup, report=report)
+    finally:
+        conn.close()
+
+
+def _repair_with_sole_access(
+    conn: sqlite3.Connection, db_path: Path, *, backup: bool, report: Dict[str, Any]
+) -> Dict[str, Any]:
+    """The repair ladder, on a connection that holds the database exclusively."""
+    if _connection_health(conn) is None:
         report["repaired"] = True
         report["strategy"] = "already_healthy"
         return report
 
     if backup:
-        bpath = _backup_db_file(db_path)
-        report["backup_path"] = str(bpath) if bpath else None
+        bpath = _backup_db_online(conn, db_path)
+        if bpath is None:
+            report["error"] = _offline_repair_needed(db_path, _repair_not_started(
+                "does not open cleanly", "the backup copy could not be written"
+            ))
+            return report
+        report["backup_path"] = str(bpath)
 
     # ── Strategy 0: rebuild FTS indexes in place (FTS write-corruption) ──
     # The FTS5 'rebuild' command rewrites the internal index from the canonical
     # content table. This is the recommended, least-destructive recovery for a
     # corrupt FTS index that rejects message writes while reads still succeed.
     try:
-        conn = sqlite3.connect(str(db_path), isolation_level=None)
-        try:
-            # The cjk index can only be rebuilt with its tokenizer loaded;
-            # best-effort (a tokenizer-less host skips it at the probe below).
-            load_fts5_cjk_extension(conn)
-            for table_name in (
-                "messages_fts", "messages_fts_trigram", "messages_fts_cjk"
-            ):
-                try:
-                    conn.execute(
-                        f"INSERT INTO {table_name}({table_name}) VALUES('rebuild')"
-                    )
-                except sqlite3.OperationalError:
-                    # Table absent (FTS disabled / trigram off / cjk not
-                    # present or tokenizer unavailable) — skip it.
-                    continue
-        finally:
-            conn.close()
-        if _db_opens_cleanly(db_path) is None:
+        # The cjk index can only be rebuilt with its tokenizer loaded;
+        # best-effort (a tokenizer-less host skips it at the probe below).
+        load_fts5_cjk_extension(conn)
+        for table_name in (
+            "messages_fts", "messages_fts_trigram", "messages_fts_cjk"
+        ):
+            try:
+                conn.execute(
+                    f"INSERT INTO {table_name}({table_name}) VALUES('rebuild')"
+                )
+            except sqlite3.OperationalError:
+                # Table absent (FTS disabled / trigram off / cjk not
+                # present or tokenizer unavailable) — skip it.
+                continue
+        if _connection_health(conn) is None:
             report["repaired"] = True
             report["strategy"] = "rebuild_fts"
             logger.warning(
@@ -964,13 +1092,8 @@ def repair_state_db_schema(db_path: Path, *, backup: bool = True) -> Dict[str, A
     # rows using the existing index definition, fixing the mismatch without
     # touching data or FTS schema.
     try:
-        conn = sqlite3.connect(str(db_path), isolation_level=None)
-        try:
-            conn.execute("REINDEX")
-            conn.commit()
-        finally:
-            conn.close()
-        if _db_opens_cleanly(db_path) is None:
+        conn.execute("REINDEX")
+        if _connection_health(conn) is None:
             report["repaired"] = True
             report["strategy"] = "reindex_btree"
             logger.warning(
@@ -981,10 +1104,11 @@ def repair_state_db_schema(db_path: Path, *, backup: bool = True) -> Dict[str, A
         logger.warning("state.db REINDEX pass failed: %s", exc)
 
     # ── Strategy 1: de-duplicate sqlite_master (keeps FTS index) ──
+    # writable_schema=RESET (not OFF) also reloads the schema, so the probe
+    # below sees the edited sqlite_master on this same connection.
     try:
-        conn = sqlite3.connect(str(db_path), isolation_level=None)
+        conn.execute("PRAGMA writable_schema=ON")
         try:
-            conn.execute("PRAGMA writable_schema=ON")
             dupes = conn.execute(
                 "SELECT type, name, COUNT(*) AS c, MIN(rowid) AS keep "
                 "FROM sqlite_master GROUP BY type, name HAVING c > 1"
@@ -995,11 +1119,9 @@ def repair_state_db_schema(db_path: Path, *, backup: bool = True) -> Dict[str, A
                     "WHERE type IS ? AND name IS ? AND rowid <> ?",
                     (type_, name, keep),
                 )
-            conn.execute("PRAGMA writable_schema=OFF")
-            conn.commit()
         finally:
-            conn.close()
-        if _db_opens_cleanly(db_path) is None:
+            conn.execute("PRAGMA writable_schema=RESET")
+        if _connection_health(conn) is None:
             report["repaired"] = True
             report["strategy"] = "dedup_schema"
             logger.warning(
@@ -1012,16 +1134,13 @@ def repair_state_db_schema(db_path: Path, *, backup: bool = True) -> Dict[str, A
 
     # ── Strategy 2: drop all FTS schema, VACUUM, rebuild on next open ──
     try:
-        conn = sqlite3.connect(str(db_path), isolation_level=None)
+        conn.execute("PRAGMA writable_schema=ON")
         try:
-            conn.execute("PRAGMA writable_schema=ON")
             conn.execute("DELETE FROM sqlite_master WHERE name LIKE 'messages_fts%'")
-            conn.execute("PRAGMA writable_schema=OFF")
-            conn.commit()
-            conn.execute("VACUUM")
         finally:
-            conn.close()
-        reason = _db_opens_cleanly(db_path)
+            conn.execute("PRAGMA writable_schema=RESET")
+        conn.execute("VACUUM")
+        reason = _connection_health(conn)
         if reason is None:
             report["repaired"] = True
             report["strategy"] = "drop_fts_rebuild"
@@ -1034,12 +1153,12 @@ def repair_state_db_schema(db_path: Path, *, backup: bool = True) -> Dict[str, A
     except sqlite3.DatabaseError as exc:
         report["error"] = str(exc)
 
-    if not report["repaired"]:
-        logger.error(
-            "state.db schema repair could not recover %s automatically "
-            "(backup: %s); manual restore from backup may be required.",
-            db_path, report["backup_path"],
-        )
+    report["error"] = _offline_repair_needed(
+        db_path,
+        "could not be repaired automatically, although the repair had sole access "
+        f"({report['error'] or 'every repair strategy failed'}; backup: "
+        f"{report['backup_path']}).",
+    )
     return report
 
 
@@ -1782,6 +1901,8 @@ class SessionDB:
         self._fts_cjk_loaded = False
         self._fts_cjk_available = False
         self._fts_unavailable_warned = False
+        # Set by memory_require_durable; re-applied when rebuild_fts reopens.
+        self._durable_writes = False
         self._conn = None
         try:
             if read_only:
@@ -1805,79 +1926,54 @@ class SessionDB:
 
             self.db_path.parent.mkdir(parents=True, exist_ok=True)
 
-            # #68474: zeroed state.db (size>0, all-NUL header) used to fail as a
-            # generic "file is not a database" with no recovery path. Quarantine
-            # the bytes (do not delete) and continue so a fresh DB can open;
-            # point the operator at pre-update snapshots.
-            if (
-                not read_only
-                and self.db_path.exists()
-                and is_zeroed_state_db(self.db_path)
-            ):
-                try:
-                    zsize = self.db_path.stat().st_size
-                except OSError:
-                    zsize = -1
-                qpath = quarantine_zeroed_state_db(self.db_path)
-                snaps = self.db_path.parent / "state-snapshots"
-                msg = (
-                    f"state.db looks ZEROED ({zsize} bytes, no SQLite header). "
-                    f"Preserved at {qpath or '(quarantine failed — file left in place)'}. "
-                    f"Restore from {snaps} via `hermes snapshot list` / "
-                    f"`hermes snapshot restore <id>` if available. "
-                    "Opening a fresh empty database so the agent can start."
-                )
-                logger.error(msg)
-                _set_last_init_error(msg)
-                # If quarantine failed, do not open the zeroed file (would fail
-                # opaquely or risk further damage). Raise with the clear message.
-                if qpath is None and self.db_path.exists() and is_zeroed_state_db(self.db_path):
-                    raise sqlite3.DatabaseError(msg)
-
             def _connect_and_init():
-                self._conn = sqlite3.connect(
-                    str(self.db_path),
-                    check_same_thread=False,
-                    # Short timeout — application-level retry with random
-                    # jitter handles contention instead of sitting in
-                    # SQLite's internal busy handler for up to 30s.
-                    timeout=1.0,
-                    # auto-starts transactions on DML, which conflicts with
-                    # our explicit BEGIN IMMEDIATE.  None = we manage
-                    # transactions ourselves.
-                    isolation_level=None,
-                )
-                self._conn.row_factory = sqlite3.Row
-                apply_wal_with_fallback(self._conn, db_label="state.db")
-                self._conn.execute("PRAGMA foreign_keys=ON")
-                self._fts_cjk_loaded = load_fts5_cjk_extension(self._conn)
+                self._open_connection()
                 self._init_schema()
 
             try:
                 _connect_and_init()
             except sqlite3.DatabaseError as exc:
-                # The malformed-schema class (e.g. a duplicate sqlite_master
-                # row for messages_fts) fails on the very first statement —
-                # before _init_schema can run — so it can't be caught at the
-                # FTS-rebuild layer. Recover by repairing sqlite_master in
-                # place (backup first; canonical sessions/messages preserved),
-                # then reopen once. This is what lets Desktop/Dashboard
-                # self-heal instead of silently showing "no sessions".
-                if not is_malformed_db_error(exc) or not _claim_repair_attempt(self.db_path):
-                    raise
-                logger.error(
-                    "state.db schema is malformed (%s) — attempting automatic "
-                    "repair (a backup copy is made first).", exc,
-                )
-                try:
+                with contextlib.suppress(Exception):
                     if self._conn is not None:
                         self._conn.close()
-                except Exception:
-                    pass
-                report = repair_state_db_schema(self.db_path)
-                if not report.get("repaired"):
-                    raise
-                _connect_and_init()
+                # #68474: a zeroed state.db (size>0, all-NUL header) is moved
+                # aside and a fresh DB opened. Its header is read only now that
+                # SQLite has rejected the file: reading it up front, on every
+                # open, closed a raw descriptor on a live database, which drops
+                # every SQLite lock this process holds on it.
+                if self._quarantine_if_zeroed(exc):
+                    # A concurrent opener may be creating the fresh database
+                    # right now; wait out its schema init briefly.
+                    for attempt in range(5):
+                        try:
+                            _connect_and_init()
+                            break
+                        except sqlite3.OperationalError as retry_exc:
+                            if attempt == 4 or not _is_lock_contention(str(retry_exc)):
+                                raise
+                            with contextlib.suppress(Exception):
+                                self._conn.close()
+                            time.sleep(0.2 * (attempt + 1))
+                else:
+                    # The malformed-schema class (e.g. a duplicate sqlite_master
+                    # row for messages_fts) fails on the very first statement —
+                    # before _init_schema can run — so it can't be caught at the
+                    # FTS-rebuild layer. Recover by repairing sqlite_master in
+                    # place (backup first; canonical sessions/messages
+                    # preserved), then reopen once. The repair runs only if no
+                    # other connection or process has the database open; when
+                    # it is refused it logs the one ERROR and this open fails.
+                    if not is_malformed_db_error(exc) or not _claim_repair_attempt(self.db_path):
+                        raise
+                    logger.warning(
+                        "state.db schema is malformed (%s) — attempting automatic "
+                        "repair, which runs only with sole access to the database.",
+                        exc,
+                    )
+                    report = repair_state_db_schema(self.db_path)
+                    if not report.get("repaired"):
+                        raise
+                    _connect_and_init()
 
             # NOTE: the v23 FTS optimization is OPT-IN (`hermes db optimize`),
             # never auto-started on open. Legacy installs keep their working
@@ -1901,6 +1997,59 @@ class SessionDB:
             # ``hermes_state._set_last_init_error(None)`` explicitly.
             _set_last_init_error(f"{type(exc).__name__}: {exc}")
             raise
+
+    def _open_connection(self) -> None:
+        """Open ``self._conn`` with this class's per-connection settings."""
+        self._conn = sqlite3.connect(
+            str(self.db_path),
+            check_same_thread=False,
+            # Short timeout — application-level retry with random
+            # jitter handles contention instead of sitting in
+            # SQLite's internal busy handler for up to 30s.
+            timeout=1.0,
+            # auto-starts transactions on DML, which conflicts with
+            # our explicit BEGIN IMMEDIATE.  None = we manage
+            # transactions ourselves.
+            isolation_level=None,
+        )
+        self._conn.row_factory = sqlite3.Row
+        apply_wal_with_fallback(self._conn, db_label="state.db")
+        self._conn.execute("PRAGMA foreign_keys=ON")
+        if self._durable_writes:
+            self._conn.execute("PRAGMA synchronous=FULL")
+        self._fts_cjk_loaded = load_fts5_cjk_extension(self._conn)
+
+    def _quarantine_if_zeroed(self, exc: sqlite3.DatabaseError) -> bool:
+        """Move a zeroed state.db aside after SQLite rejected it (#68474).
+
+        Returns True when the file was moved and a fresh database can be
+        opened; False when *exc* is not that case. Raises when the file is
+        zeroed but could not be moved.
+        """
+        if "not a database" not in str(exc).lower():
+            return False
+        if not (self.db_path.exists() and is_zeroed_state_db(self.db_path)):
+            return False
+        try:
+            zsize = self.db_path.stat().st_size
+        except OSError:
+            zsize = -1
+        qpath = quarantine_zeroed_state_db(self.db_path)
+        snaps = self.db_path.parent / "state-snapshots"
+        msg = (
+            f"state.db looks ZEROED ({zsize} bytes, no SQLite header). "
+            f"Preserved at {qpath or '(quarantine failed — file left in place)'}. "
+            f"Restore from {snaps} via `hermes snapshot list` / "
+            f"`hermes snapshot restore <id>` if available. "
+            "Opening a fresh empty database so the agent can start."
+        )
+        logger.error(msg)
+        _set_last_init_error(msg)
+        # If quarantine failed, do not open the zeroed file (would fail
+        # opaquely or risk further damage). Raise with the clear message.
+        if qpath is None and self.db_path.exists() and is_zeroed_state_db(self.db_path):
+            raise sqlite3.DatabaseError(msg)
+        return True
 
     # ── Core write helper ──
 
@@ -2337,6 +2486,11 @@ class SessionDB:
         E2E-verified: a corrupted ``messages_fts_data`` shadow table rejects
         every append; after the in-place rebuild the same append succeeds and
         search works again.
+
+        The rebuild runs only with sole access to the database (see
+        :meth:`rebuild_fts`); when another connection or process has it open
+        the rebuild is refused, ``rebuild_fts`` logs the one ERROR, and this
+        returns False.
         """
         if self._fts_runtime_rebuild_attempted:
             return False
@@ -2347,22 +2501,25 @@ class SessionDB:
         self._fts_runtime_rebuild_attempted = True
         logger.warning(
             "state.db write failed with an FTS-corruption error (%s) — "
-            "attempting one-shot in-place FTS rebuild; canonical message "
-            "rows are preserved.", exc,
+            "attempting one-shot in-place FTS rebuild, which runs only with "
+            "sole access; canonical message rows are preserved.", exc,
         )
         try:
             rebuilt = self.rebuild_fts()
+        except StateDBRepairRefused:
+            return False
         except Exception as rebuild_exc:
-            logger.error(
-                "In-place FTS rebuild failed (%s); the database needs the "
-                "full offline repair path (repair_state_db_schema).",
-                rebuild_exc,
+            _offline_repair_needed(
+                self.db_path,
+                f"has an FTS index that rejects writes, and the in-place FTS "
+                f"rebuild failed ({rebuild_exc}).",
             )
             return False
         if not rebuilt:
-            logger.error(
-                "In-place FTS rebuild made no progress; the database needs "
-                "the full offline repair path (repair_state_db_schema)."
+            _offline_repair_needed(
+                self.db_path,
+                "has an FTS index that rejects writes, and the in-place FTS "
+                "rebuild made no progress.",
             )
             return False
         logger.warning(
@@ -10349,22 +10506,54 @@ class SessionDB:
 
         Safe to call when FTS tables don't exist (skips them).
         Returns the number of FTS indexes that were rebuilt.
+
+        Runs only with sole access: this instance closes its own connection,
+        the rebuild runs on a connection holding the database exclusively
+        (``_open_sole_access``), and the instance reconnects afterwards. When
+        any other connection or process has the database open, nothing is
+        changed, one ERROR says the offline repair is needed, and
+        :class:`StateDBRepairRefused` is raised.
         """
         rebuilt = 0
         with self._lock:
-            for tbl in self._FTS_TABLES:
-                if not self._fts_table_exists(tbl):
-                    continue
+            if self.read_only or self._conn is None:
+                return 0
+            self._conn.close()
+            try:
+                guard, reason = _open_sole_access(self.db_path)
+                if guard is None:
+                    raise StateDBRepairRefused(_offline_repair_needed(
+                        self.db_path, _repair_not_started(
+                            "has an FTS index that rejects writes", reason
+                        ),
+                    ))
                 try:
-                    self._conn.execute(
-                        f"INSERT INTO {tbl}({tbl}) VALUES('rebuild')"
-                    )
-                    self._conn.commit()
-                    rebuilt += 1
-                except sqlite3.OperationalError as exc:
-                    self._conn.rollback()
+                    load_fts5_cjk_extension(guard)
+                    for tbl in self._FTS_TABLES:
+                        try:
+                            guard.execute(f"SELECT 1 FROM {tbl} LIMIT 0")
+                        except sqlite3.DatabaseError:
+                            continue  # absent or not queryable here
+                        try:
+                            guard.execute(
+                                f"INSERT INTO {tbl}({tbl}) VALUES('rebuild')"
+                            )
+                            rebuilt += 1
+                        except sqlite3.OperationalError as exc:
+                            logger.warning(
+                                "FTS rebuild failed for %s: %s", tbl, exc
+                            )
+                finally:
+                    guard.close()
+            finally:
+                try:
+                    self._open_connection()
+                except sqlite3.Error as exc:
+                    # Leaves the closed connection in place: every later call
+                    # raises a sqlite3 error, which callers already handle.
                     logger.warning(
-                        "FTS rebuild failed for %s: %s", tbl, exc
+                        "state.db could not be reopened after the FTS rebuild "
+                        "attempt: %s", exc,
                     )
         return rebuilt
 

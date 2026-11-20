@@ -171,27 +171,26 @@ def test_strategy_b_rebuild_when_dedup_insufficient(tmp_path, monkeypatch):
     # escalates past the in-place-rebuild and dedup passes to strat 2 (drop FTS
     # + VACUUM) and runs its real SQL against the file. Keyed on whether the FTS
     # schema is still present rather than a call counter, so it stays correct as
-    # earlier verification call sites are added/removed.
-    real_check = hermes_state._db_opens_cleanly
+    # earlier verification call sites are added/removed. The repair probes on
+    # its own sole-access connection, so the fake does too.
+    real_check = hermes_state._connection_health
     calls = {"n": 0}
 
-    def flaky_check(path):
+    def flaky_check(conn):
         calls["n"] += 1
         try:
-            probe = sqlite3.connect(str(path))
-            still_has_fts = probe.execute(
+            still_has_fts = conn.execute(
                 "SELECT COUNT(*) FROM sqlite_master "
                 "WHERE name LIKE 'messages_fts%'"
             ).fetchone()[0]
-            probe.close()
         except sqlite3.DatabaseError:
             # sqlite_master still malformed (pre-dedup) — treat as broken.
             return "pretend still broken (schema unreadable)"
         if still_has_fts:
             return "pretend in-place/dedup passes were insufficient"
-        return real_check(path)
+        return real_check(conn)
 
-    monkeypatch.setattr(hermes_state, "_db_opens_cleanly", flaky_check)
+    monkeypatch.setattr(hermes_state, "_connection_health", flaky_check)
     report = repair_state_db_schema(db_path)
     monkeypatch.undo()
 
@@ -210,16 +209,23 @@ def test_strategy_b_rebuild_when_dedup_insufficient(tmp_path, monkeypatch):
 
 
 def test_unrepairable_file_fails_safely(tmp_path, monkeypatch):
-    """A file too damaged to recover must report failure, keep a backup, and
-    never raise from the repair routine itself."""
+    """A file too damaged to recover must report failure, leave the original
+    bytes untouched, and never raise from the repair routine itself.
+
+    SQLite cannot open it, so the repair cannot take its sole-access lock and
+    changes nothing; the untouched file is what manual restore starts from
+    (the online backup API cannot read it either, and a raw copy is never
+    taken: closing a raw descriptor drops this process's SQLite locks)."""
     db_path = tmp_path / "state.db"
-    db_path.write_bytes(b"SQLite format 3\x00" + b"\x00\xde\xad\xbe\xef" * 200)
+    damaged = b"SQLite format 3\x00" + b"\x00\xde\xad\xbe\xef" * 200
+    db_path.write_bytes(damaged)
 
     report = repair_state_db_schema(db_path)
     assert report["repaired"] is False
-    assert report["error"]
-    # The (damaged) original bytes are preserved for manual restore.
-    assert report["backup_path"] and Path(report["backup_path"]).exists()
+    assert report["refused"] is False  # damaged, not held by anyone
+    assert hermes_state.STATE_DB_OFFLINE_REPAIR_MARKER in report["error"]
+    assert report["backup_path"] is None
+    assert db_path.read_bytes() == damaged
 
 
 def test_non_malformed_error_is_not_auto_repaired(tmp_path, monkeypatch):
