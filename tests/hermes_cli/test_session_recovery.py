@@ -332,7 +332,8 @@ def test_failed_repair_points_the_user_at_offline_recovery(tmp_path: Path) -> No
     in-place ladder, prints "keep the files", and stops -- leaving the user
     with no idea that a non-destructive recovery path exists. The failure
     branch has to hand them the next command, inspection first, seeded with
-    the preserved backup it just made.
+    the file it preserved (its backup, or the untouched original when the
+    repair could not start).
     """
     hermes_home = tmp_path / "isolated-hermes-home"
     hermes_home.mkdir()
@@ -356,6 +357,9 @@ def test_failed_repair_points_the_user_at_offline_recovery(tmp_path: Path) -> No
     # The pointer, and specifically the read-only step first.
     assert "sessions recover" in combined, combined
     assert "--inspect-only" in combined, combined
-    # It must offer the source it actually preserved, not a placeholder.
+    # It must offer the source it actually preserved, not a placeholder. SQLite
+    # cannot open this file, so the repair changed nothing and the preserved
+    # source is the untouched original.
     assert "--source" in combined, combined
-    assert "malformed-backup" in combined, combined
+    assert f"--source {hermes_home / 'state.db'}" in combined, combined
+    assert "Nothing was changed" in combined, combined

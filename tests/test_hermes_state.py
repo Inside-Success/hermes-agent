@@ -5302,7 +5302,8 @@ class TestConcurrentWriteSafety:
         # There is no public API, so we check the kwarg via the module default.
         import inspect
         from hermes_state import SessionDB as _SessionDB
-        src = inspect.getsource(_SessionDB.__init__)
+        # The connection is opened in _open_connection (also used to reconnect).
+        src = inspect.getsource(_SessionDB._open_connection)
         assert "30" in src, (
             "SQLite timeout should be at least 30s to handle CLI/gateway lock contention"
         )
