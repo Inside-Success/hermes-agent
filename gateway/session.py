@@ -342,6 +342,24 @@ that requires raw IDs).  Discord is excluded because mentions use ``<@user_id>``
 and the LLM needs the real ID to tag users."""
 
 
+def _slack_thread_rides_user_message(source: "SessionSource") -> bool:
+    """True when a Slack thread id should stay out of the system prompt.
+
+    Only for profiles that share one prompt cache across sessions
+    (``openrouter.prompt_cache_session: profile``); every other profile keeps
+    upstream behaviour. Inside Success patch, 2026-11-19.
+    """
+    if source.platform != Platform.SLACK or not source.thread_id:
+        return False
+    try:
+        from hermes_cli.config import load_config_readonly
+
+        mode = (load_config_readonly().get("openrouter") or {}).get("prompt_cache_session")
+        return str(mode or "").strip().lower() == "profile"
+    except Exception:
+        return False
+
+
 def _slack_tools_loaded() -> bool:
     """True iff the agent will actually have Slack tools this session.
 
@@ -512,6 +530,13 @@ def build_session_context_prompt(
                 desc = _cname
         else:
             desc = src.description
+            if _slack_thread_rides_user_message(src):
+                # Cache-stable system prompt (Inside Success patch, 2026-11-19):
+                # the Slack thread id is new for every conversation, and any
+                # change before the user message makes OpenRouter reuse none of
+                # the cached prompt. The gateway passes the thread id on the
+                # user message instead (see run.py, "Slack thread:" note).
+                desc = desc.replace(f", thread: {src.thread_id}", "")
         lines.append(
             f"**Source:** {platform_name} ({_format_untrusted_prompt_value(desc)})"
         )
