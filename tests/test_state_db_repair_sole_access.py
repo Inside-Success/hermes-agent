@@ -336,7 +336,10 @@ def test_rebuild_fts_reconnects_with_the_same_connection_settings(tmp_path):
     _build(db_path)
     db = SessionDB(db_path=db_path)
     try:
-        db.memory_require_durable()
+        # Runtime branch: native memory (memory_require_durable) is not on this base;
+        # set the same durable-write state it sets.
+        db._durable_writes = True
+        db._conn.execute('PRAGMA synchronous=FULL')
         assert db.rebuild_fts() >= 1
         assert db._conn.execute("PRAGMA foreign_keys").fetchone()[0] == 1
         assert db._conn.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
